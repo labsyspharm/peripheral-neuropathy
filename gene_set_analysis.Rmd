@@ -22,9 +22,8 @@ syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
 DEA performed by Riki Kawaguchi from UCLA
 
 ```{r}
-de_raw <- syn("syn63837982") %>%
+de_raw <- syn("syn63854283") %>%
   readxl::read_excel()
-
 
 de_long <- de_raw %>%
   select(
@@ -66,7 +65,15 @@ contrast_map <- c(
 
 de_long_selected <- de_long %>%
   filter(contrast %in% names(contrast_map)) %>%
-  mutate(contrast = contrast_map[contrast])
+  mutate(
+    contrast = contrast_map[contrast],
+    perturbed = case_when(
+      FDR > .05 ~ "not perturbed",
+      logFC > 0 ~ "up",
+      logFC < 0 ~ "down",
+      TRUE ~ NA_character_
+    )
+  )
 ```
 
 PTX rescue
@@ -109,8 +116,16 @@ ptx_rescue_plot_data <- tribble(
     across(
       starts_with("signed_padj"),
       list(
-        clamped = \(x) if_else(abs(x) > 100, sign(x) * 100, x),
-        symbol = \(x) clamp_symbols(x, if (cur_column() == "signed_padj_1") c("left", "right") else c("up", "down"), 100)
+        clamped = \(x) if_else(
+          abs(x) > if (cur_column() == "signed_padj_1") 25 else 100,
+          sign(x) * if (cur_column() == "signed_padj_1") 25 else 100,
+          x
+        ),
+        symbol = \(x) clamp_symbols(
+          x,
+          if (cur_column() == "signed_padj_1") c("right", "left") else c("up", "down"),
+          if (cur_column() == "signed_padj_1") 25 else 100
+        )
       )
     ),
     signed_padj_symbol = case_when(
@@ -189,7 +204,7 @@ ggsave(
 de_long_selected_wide <- de_long_selected %>%
   pivot_wider(
     names_from = contrast,
-    values_from = c(logFC, PValue, FDR, LR, logCPM, FDR_min_zero, signed_padj)
+    values_from = c(logFC, PValue, FDR, LR, logCPM, FDR_min_zero, signed_padj, perturbed)
   )
 
 
@@ -204,103 +219,73 @@ First approach:
 lest 1 logs in GNE-495 + PTX or JNK-inh + PTX
 
 ```{r}
-RECOVERY_THRESHOLD <- 1
-
-pax_rescue_list <- de_long_selected_wide %>%
-  mutate(
-    across(
-      matches("logFC_.*vs PTX"),
-      list(
-        logFC_recovery = \(x) x - logFC_PTX
-      )
-    )
+ptx_rescue_list <- de_long_selected %>%
+  filter(contrast == "PTX") %>%
+  power_inner_join(
+    de_long_selected %>%
+      filter(
+        str_detect(contrast, fixed("+ PTX"))
+      ) %>%
+      separate_wider_regex(
+        contrast,
+        patterns = c(compound = "(?:GNE-495|JNK-inh)", " ", contrast = ".*")
+      ) %>%
+      select(
+        gene_id, compound, contrast,
+        logFC, PValue, FDR, perturbed
+      ) %>%
+      pivot_wider(
+        names_from = contrast,
+        values_from = c(logFC, PValue, FDR, perturbed),
+        names_sep = " "
+      ),
+    by = "gene_id"
   ) %>%
   mutate(
-    `GNE-495 + PTX perturbed` = case_when(
-      `FDR_GNE-495 + PTX` > .05 ~ "not perturbed",
-      `logFC_GNE-495 + PTX` > 0 ~ "up",
-      `logFC_GNE-495 + PTX` < 0 ~ "down",
-      TRUE ~ NA_character_
+    rescue_significant_opposite = case_when(
+      is.na(perturbed) | perturbed == "not perturbed" ~ "not perturbed",
+      perturbed == "up" & `FDR + PTX vs PTX` < .05 & `logFC + PTX vs PTX` < 0 ~ "rescued",
+      perturbed == "down" & `FDR + PTX vs PTX` < .05 & `logFC + PTX vs PTX` > 0 ~ "rescued",
+      TRUE ~ "unrescued"
     ),
-    `JNK-inh + PTX perturbed` = case_when(
-      `FDR_JNK-inh + PTX` > .05 ~ "not perturbed",
-      `logFC_JNK-inh + PTX` > 0 ~ "up",
-      `logFC_JNK-inh + PTX` < 0 ~ "down",
-      TRUE ~ NA_character_
+    rescue_return_baseline = case_when(
+      is.na(perturbed) | perturbed == "not perturbed" ~ "not perturbed",
+      `FDR + PTX` > .05 ~ "rescued",
+      TRUE ~ "unrescued"
     ),
-    `PTX perturbed` = case_when(
-      FDR_PTX > .05 ~ "not perturbed",
-      logFC_PTX > 0 ~ "up",
-      logFC_PTX < 0 ~ "down",
-      TRUE ~ NA_character_
-    ),
-    `GNE-495 + PTX rescue` = case_when(
-      is.na(`PTX perturbed`) | `PTX perturbed` == "not perturbed" ~ "not perturbed",
-      `PTX perturbed` == "up" & `FDR_GNE-495 + PTX vs PTX` < .05 & `logFC_GNE-495 + PTX vs PTX` < 0 ~ "up rescued",
-      `PTX perturbed` == "down" & `FDR_GNE-495 + PTX vs PTX` < .05 & `logFC_GNE-495 + PTX vs PTX` > 0 ~ "down rescued",
-      TRUE ~ paste(`PTX perturbed`, "unrescued", sep = " ")
-    ),
-    `JNK-inh + PTX rescue` = case_when(
-      is.na(`PTX perturbed`) | `PTX perturbed` == "not perturbed" ~ "not perturbed",
-      `PTX perturbed` == "up" & `FDR_JNK-inh + PTX vs PTX` < .05 & `logFC_JNK-inh + PTX vs PTX` < 0 ~ "up rescued",
-      `PTX perturbed` == "down" & `FDR_JNK-inh + PTX vs PTX` < .05 & `logFC_JNK-inh + PTX vs PTX` > 0 ~ "down rescued",
-      TRUE ~ paste(`PTX perturbed`, "unrescued", sep = " ")
-    ),
-    `GNE-495 + PTX rescue DMSO` = case_when(
-      is.na(`PTX perturbed`) | `PTX perturbed` == "not perturbed" ~ "not perturbed",
-      `PTX perturbed` == "up" & `FDR_GNE-495 + PTX` > .05 ~ "up rescued",
-      `PTX perturbed` == "down" & `FDR_GNE-495 + PTX` > .05 ~ "down rescued",
-      TRUE ~ paste(`PTX perturbed`, "unrescued", sep = " ")
-    ),
-    `JNK-inh + PTX rescue DMSO` = case_when(
-      is.na(`PTX perturbed`) | `PTX perturbed` == "not perturbed" ~ "not perturbed",
-      `PTX perturbed` == "up" & `FDR_JNK-inh + PTX` > .05 ~ "up rescued",
-      `PTX perturbed` == "down" & `FDR_JNK-inh + PTX` > .05 ~ "down rescued",
-      TRUE ~ paste(`PTX perturbed`, "unrescued", sep = " ")
-    ),
-    `GNE-495 + PTX rescue DMSO plus` = case_when(
-      is.na(`PTX perturbed`) | `PTX perturbed` == "not perturbed" ~ "not perturbed",
-      `PTX perturbed` == "up" & (`FDR_GNE-495 + PTX` > .05 | `logFC_GNE-495 + PTX` < 0) ~ "up rescued",
-      `PTX perturbed` == "down" & (`FDR_GNE-495 + PTX` > .05 | `logFC_GNE-495 + PTX` > 0) ~ "down rescued",
-      TRUE ~ paste(`PTX perturbed`, "unrescued", sep = " ")
-    ),
-    `JNK-inh + PTX rescue DMSO plus` = case_when(
-      is.na(`PTX perturbed`) | `PTX perturbed` == "not perturbed" ~ "not perturbed",
-      `PTX perturbed` == "up" & (`FDR_JNK-inh + PTX` > .05 | `logFC_JNK-inh + PTX` < 0) ~ "up rescued",
-      `PTX perturbed` == "down" & (`FDR_JNK-inh + PTX` > .05 | `logFC_JNK-inh + PTX` > 0) ~ "down rescued",
-      TRUE ~ paste(`PTX perturbed`, "unrescued", sep = " ")
-    ),
-    # `GNE-495 + PTX_rescue` = case_when(
-    #   is.na(PTX_perturbed) | PTX_perturbed == "not perturbed" ~ "not perturbed",
-    #   PTX_perturbed == "up" & `logFC_GNE-495 + PTX vs PTX_logFC_recovery` < -RECOVERY_THRESHOLD ~ "up_recovered",
-    #   PTX_perturbed == "down" & `logFC_GNE-495 + PTX vs PTX_logFC_recovery` > RECOVERY_THRESHOLD ~ "down_recovered",
-    #   TRUE ~ paste(PTX_perturbed, "unrecovered", sep = "_")
-    # ),
-    # `JNK-inh + PTX_rescue` = case_when(
-    #   is.na(PTX_perturbed) | PTX_perturbed == "not perturbed" ~ "not perturbed",
-    #   PTX_perturbed == "up" & `logFC_JNK-inh + PTX vs PTX_logFC_recovery` < -RECOVERY_THRESHOLD ~ "up_recovered",
-    #   PTX_perturbed == "down" & `logFC_JNK-inh + PTX vs PTX_logFC_recovery` > RECOVERY_THRESHOLD ~ "down_recovered",
-    #   TRUE ~ paste(PTX_perturbed, "unrecovered", sep = "_")
-    # )
+    rescue_return_baseline_plus = case_when(
+      is.na(perturbed) | perturbed == "not perturbed" ~ "not perturbed",
+      perturbed == "up" & (`FDR + PTX` > .05 | `logFC + PTX` < 0) ~ "rescued",
+      perturbed == "down" & (`FDR + PTX` > .05 | `logFC + PTX` > 0) ~ "rescued",
+      TRUE ~ "unrescued"
+    )
   )
 
-pax_rescue_list_simple <- pax_rescue_list %>%
-  filter(`PTX perturbed` != "not perturbed") %>%
-  transmute(
-    gene_id, gene_name, gene_type,
-    across(ends_with(" perturbed")),
-    across(
-      ends_with(" rescue"),
-      # \(x) str_replace(x, " unrescued", "") %>%
-      \(x) str_replace(x, "up unrescued", "no rescue") %>%
-        str_replace("down unrescued", "no rescue") %>%
-        str_replace("up rescued", "rescued") %>%
-        str_replace("down rescued", "rescued")
-    ),
-    `Rescue type` = case_when(
-      `GNE-495 + PTX rescue` == "rescued" & `JNK-inh + PTX rescue` == "rescued" ~ "both",
-      `GNE-495 + PTX rescue` == "rescued" ~ "GNE-495 only rescue",
-      `JNK-inh + PTX rescue` == "rescued" ~ "JNK-inh only rescue",
+ptx_rescue_list_neat <- ptx_rescue_list %>%
+  select(
+    gene_id, compound, perturbed,
+    starts_with("rescue")
+  )
+
+ptx_rescue_list_long <- ptx_rescue_list_neat %>%
+  pivot_longer(
+    starts_with("rescue"),
+    names_pattern = "rescue_(.*)",
+    names_to = "rescue_definition",
+    values_to= "rescue"
+  )
+
+ptx_rescue_type_list <- ptx_rescue_list_long %>%
+  pivot_wider(
+    names_from = compound,
+    values_from = rescue
+  ) %>%
+  mutate(
+    rescue_type = case_when(
+      perturbed == "not perturbed" ~ "not perturbed",
+      `GNE-495` == "rescued" & `JNK-inh` == "rescued" ~ "both",
+      `GNE-495` == "rescued" ~ "GNE-495 only",
+      `JNK-inh` == "rescued" ~ "JNK-inh only",
       TRUE ~ "no rescue"
     )
   )
@@ -308,42 +293,43 @@ pax_rescue_list_simple <- pax_rescue_list %>%
 
 
 ```{r}
+rescue_type_colors = c(
+  both = "black",
+  `JNK-inh only` = "purple",
+  `GNE-495 only` = "green",
+  `no rescue` = "gray85"
+)
+```
+
+```{r}
 ptx_rescue_plot_data_w_type <- ptx_rescue_plot_data %>%
   left_join(
-    pax_rescue_list_simple %>%
-      select(-gene_name, -gene_type),
-    by = "gene_id"
+    ptx_rescue_type_list,
+    by = "gene_id",
+    relationship = "many-to-many"
   ) %>%
   mutate(
-    `Rescue type` = replace_na(`Rescue type`, "not perturbed") %>%
+    rescue_type = replace_na(rescue_type, "not perturbed") %>%
       factor(
         levels = c(
           "both",
-          "JNK-inh only rescue",
-          "GNE-495 only rescue",
+          "JNK-inh only",
+          "GNE-495 only",
           "no rescue",
           "not perturbed"
         )
       )
-  )
+  )  %>%
+  filter(rescue_type != "not perturbed") %>%
+  arrange(desc(rescue_type))
 
 p <- ggplot(
-  ptx_rescue_plot_data %>%
-    left_join(
-      pax_rescue_list_simple %>%
-        select(-gene_name, -gene_type),
-      by = "gene_id"
-    ) %>%
-    mutate(
-      `Rescue type` = replace_na(`Rescue type`, "not perturbed")
-    ) %>%
-    filter(`Rescue type` != "not perturbed") %>%
-    arrange(desc(`Rescue type`)),
+  ptx_rescue_plot_data_w_type,
   aes(
     x = signed_padj_1_clamped,
     y = signed_padj_2_clamped,
     shape = signed_padj_symbol,
-    color = `Rescue type`
+    color = rescue_type
   )
 ) +
   geom_abline() +
@@ -355,46 +341,32 @@ p <- ggplot(
     guide = "none"
   ) +
   scale_color_manual(
-    values = c(
-      both = "black",
-      `JNK-inh only rescue` = "purple",
-      `GNE-495 only rescue` = "green",
-      `no rescue` = "gray85"
-    )
+    values = rescue_type_colors
   ) +
-  ggh4x::facet_wrap2(
-    ~contrast_2,
+  ggh4x::facet_grid2(
+    rescue_definition ~ contrast_2,
     scales = "free", axes = "all"
   ) +
   labs(
     x = "Signed log10(padj) Paclitaxel",
-    y = "Signed log10(padj) Rescue"
+    y = "Signed log10(padj) Rescue",
+    color = "Rescue"
   )
 
 dir.create("plots", showWarnings = FALSE)
 ggsave(
-  file.path("plots", "ptx_rescue_scatter_w_rescue_type.pdf"),
-  p, width = 8, height = 4, device = cairo_pdf
+  file.path("plots", "ptx_rescue_scatter_w_rescue_type_all.pdf"),
+  p, width = 8, height = 8, device = cairo_pdf
 )
 
 
 p <- ggplot(
-  ptx_rescue_plot_data %>%
-    left_join(
-      pax_rescue_list_simple %>%
-        select(-gene_name, -gene_type),
-      by = "gene_id"
-    ) %>%
-    mutate(
-      `Rescue type` = replace_na(`Rescue type`, "not perturbed")
-    ) %>%
-    filter(`Rescue type` != "not perturbed") %>%
-    arrange(desc(`Rescue type`)),
+  ptx_rescue_plot_data_w_type,
   aes(
     x = logFC_1,
     y = logFC_2,
     # shape = signed_padj_symbol,
-    color = `Rescue type`
+    color = rescue_type
   )
 ) +
   geom_abline() +
@@ -403,28 +375,32 @@ p <- ggplot(
     shape = "circle small"
   ) +
   scale_color_manual(
-    values = c(
-      both = "black",
-      `JNK-inh only rescue` = "purple",
-      `GNE-495 only rescue` = "green",
-      `no rescue` = "gray85"
-    )
+    values = rescue_type_colors
   ) +
-  ggh4x::facet_wrap2(
-    ~contrast_2,
+  ggh4x::facet_grid2(
+    rescue_definition ~ contrast_2,
     scales = "free", axes = "all"
   ) +
   labs(
     x = "log2(fold-change) Paclitaxel",
-    y = "log2(fold-change) Rescue"
+    y = "log2(fold-change) Rescue",
+    color = "Rescue"
   )
 
 dir.create("plots", showWarnings = FALSE)
 ggsave(
-  file.path("plots", "ptx_rescue_scatter_logFC_w_rescue_type.pdf"),
-  p, width = 8, height = 4, device = cairo_pdf
+  file.path("plots", "ptx_rescue_scatter_logFC_w_rescue_type_all.pdf"),
+  p, width = 8, height = 8, device = cairo_pdf
 )
 ```
+
+
+```{r}
+
+
+```
+
+
 
 ```{r}
 fpkm_raw <- syn("syn63854603") %>%
@@ -445,10 +421,11 @@ fpkm_long$condition %>%
 ```{r}
 selected_genes <- withr::with_seed(
   42,
-  pax_rescue_list_simple %>%
+  ptx_rescue_type_list %>%
     group_by(
-      `Rescue type`,
-      `PTX perturbed`
+      rescue_definition,
+      rescue_type,
+      perturbed
     ) %>%
     slice_sample(n = 3) %>%
     ungroup()
@@ -474,42 +451,54 @@ selected_genes_fpkm <- selected_genes %>%
     by = "gene_id"
   )
 
-p <- ggplot(
-  selected_genes_fpkm %>%
-    arrange(`Rescue type`) %>%
-    mutate(
-      gene_name.x = fct_inorder(gene_name.x)
-    ),
-  aes(
-    x = condition,
-    y = value,
+ps <- selected_genes_fpkm %>%
+  group_nest(
+    rescue_definition
+  ) %>%
+  mutate(
+    p = map(
+      data,
+      \(x) ggplot(
+        x %>%
+          arrange(rescue_type, perturbed) %>%
+          mutate(
+            gene_name = fct_inorder(gene_name)
+          ),
+        aes(
+          x = condition,
+          y = value,
+        )
+      ) +
+        geom_rect(
+          aes(fill = rescue_type),
+          xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, alpha = 0.3,
+          inherit.aes = FALSE,
+          data = \(x) x %>%
+            distinct(gene_name, rescue_type)
+        ) +
+        geom_beeswarm() +
+        geom_boxplot(
+          outlier.shape = NA,
+          fill = NA
+        ) +
+        scale_fill_manual(
+          values = rescue_type_colors
+        ) +
+        ggh4x::facet_wrap2(~gene_name, scales = "free_y", axes = "y") +
+        theme(
+          axis.text.x = element_text(angle = 45, hjust = 1)
+        ) +
+        labs(y = "FPKM")
+          )
   )
-) +
-  geom_rect(
-    aes(fill = `Rescue type`),
-    xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, alpha = 0.3,
-    inherit.aes = FALSE,
-    data = \(x) x %>%
-      distinct(gene_name.x, `Rescue type`)
-  ) +
-  geom_beeswarm() +
-  geom_boxplot(
-    outlier.shape = NA,
-    fill = NA
-  ) +
-  scale_fill_manual(
-    values = c(
-      both = "black",
-      `JNK-inh only rescue` = "purple",
-      `GNE-495 only rescue` = "green",
-      `no rescue` = "gray85"
-    )
-  ) +
-  ggh4x::facet_wrap2(~gene_name.x, scales = "free_y", axes = "y") +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  ) +
-  labs(y = "FPKM")
+
+pwalk(
+  ps,
+  \(p, rescue_definition, ...) ggsave(
+    file.path("plots", paste0("selected_genes_fpkm_", rescue_definition, ".pdf")),
+    p, width = 8, height = 6, device = cairo_pdf
+  )
+)
 
 ggsave(
   file.path("plots", "selected_genes_fpkm.pdf"),
