@@ -41,7 +41,11 @@ de_long <- de_raw %>%
   ) %>%
   mutate(
     FDR_min_zero = if_else(FDR == 0, min(FDR[FDR > 0]) * .5, FDR),
-    signed_padj = -sign(logFC) * log10(FDR_min_zero)
+    signed_padj = -sign(logFC) * log10(FDR_min_zero),
+    across(
+      gene_id,
+      \(x) str_remove(x, "\\.[0-9]+")
+    )
   )
   # separate_longer_delim(
   #   -c(gene_id, gene_name, gene_type, Description, chromosome, strand),
@@ -75,6 +79,104 @@ de_long_selected <- de_long %>%
     )
   )
 ```
+
+
+```{r}
+raw_counts <- syn("syn63854604") %>%
+  read_csv()
+
+raw_counts_long <- raw_counts %>%
+  pivot_longer(
+    -c(gene_id, gene_name, gene_type, Description, chromosome, strand),
+    names_to = c("sample_id", "condition"),
+    names_pattern = "(S[0-9]+)_(.*)",
+    values_to = "value"
+  ) %>%
+  mutate(
+    across(
+      gene_id,
+      \(x) str_remove(x, "\\.[0-9]+")
+    )
+  )
+
+gene_id_gene_symbol_map <- raw_counts_long %>%
+  distinct(gene_id, gene_name)
+
+feasible_genes <- raw_counts_long %>%
+  group_by(gene_id) %>%
+  summarize(
+    feasible = sum(value > 5) > 3,
+    .groups = "drop"
+  )
+```
+
+```{r}
+de_meta <- raw_counts_long %>%
+  distinct(sample_id, condition)
+
+de_all <- DESeq2::DESeqDataSetFromMatrix(
+  raw_counts_long %>%
+    select(gene_id, sample_id, value) %>%
+    pivot_wider(names_from = sample_id, values_from = value) %>%
+    column_to_rownames("gene_id") %>%
+    as.matrix() %>%
+    {.[, de_meta$sample_id]},
+  de_meta,
+  design = ~ condition
+) %>%
+  DESeq2::estimateSizeFactors()
+
+counts_trans <- list(
+  vsn = SummarizedExperiment::assay(DESeq2::varianceStabilizingTransformation(de_all, blind = FALSE)),
+  rlog = SummarizedExperiment::assay(DESeq2::rlog(de_all, blind = FALSE)),
+  normalized = DESeq2::counts(de_all, normalized = TRUE),
+  raw = DESeq2::counts(de_all, normalized = FALSE)
+) %>%
+  map(
+    \(x) as_tibble(x, rownames = "gene_id")
+  ) %>%
+  bind_rows(.id = "transformation") %>%
+  mutate(
+    across(gene_id, \(x) str_remove(x, "\\.\\d+$"))
+  ) %>%
+  select(transformation, gene_id, everything())
+
+
+write_csv(
+  counts_trans,
+  "transformed_counts.csv.gz"
+)
+counts_trans <- read_csv("transformed_counts.csv.gz")
+
+rlog_mat <- counts_trans %>%
+  filter(transformation == "rlog") %>%
+  dplyr::select(-transformation) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+rlog_scaled <- rlog_mat %>%
+  t() %>%
+  scale() %>%
+  t()
+
+dmso_means <- rlog_mat[
+  ,
+  de_meta %>%
+    filter(condition == "DMSO") %>%
+    pull(sample_id)
+] %>%
+  rowMeans()
+
+# Scale so that mean is 0 at expression level of DMSO and scaled to SD of 1
+rlog_scaled2 <- {
+  rlog_mat - dmso_means
+} %>%
+  t() %>%
+  scale(center = FALSE) %>%
+  t()
+
+```
+
 
 PTX rescue
 
@@ -218,8 +320,10 @@ First approach:
 - Find genes up or down in PTX treatment, identify those that are rescued by at
 lest 1 logs in GNE-495 + PTX or JNK-inh + PTX
 
+Here `x + PTX` is `x + PTX vs DMSO`, bare values are `PTX vs DMSO`
+
 ```{r}
-ptx_rescue_list <- de_long_selected %>%
+ptx_rescue_by_compound <- de_long_selected %>%
   filter(contrast == "PTX") %>%
   power_inner_join(
     de_long_selected %>%
@@ -232,15 +336,17 @@ ptx_rescue_list <- de_long_selected %>%
       ) %>%
       select(
         gene_id, compound, contrast,
-        logFC, PValue, FDR, perturbed
+        logFC, PValue, FDR, perturbed, signed_padj
       ) %>%
       pivot_wider(
         names_from = contrast,
-        values_from = c(logFC, PValue, FDR, perturbed),
+        values_from = c(logFC, PValue, FDR, perturbed, signed_padj),
         names_sep = " "
       ),
     by = "gene_id"
-  ) %>%
+  )
+
+ptx_rescue_list <- ptx_rescue_by_compound %>%
   mutate(
     rescue_significant_opposite = case_when(
       is.na(perturbed) | perturbed == "not perturbed" ~ "not perturbed",
@@ -294,10 +400,11 @@ ptx_rescue_type_list <- ptx_rescue_list_long %>%
 
 ```{r}
 rescue_type_colors = c(
-  both = "black",
-  `JNK-inh only` = "purple",
-  `GNE-495 only` = "green",
-  `no rescue` = "gray85"
+  both = "purple",
+  `JNK-inh only` = "red",
+  `GNE-495 only` = "blue",
+  `no rescue` = "black",
+  `not perturbed` = "gray50"
 )
 ```
 
@@ -394,12 +501,1306 @@ ggsave(
 )
 ```
 
+## Gene sets
 
 ```{r}
+library(msigdbr)
+all_msigdbr <- msigdbr()
 
+msigdbr_of_interest <- all_msigdbr %>%
+  filter(
+    gs_cat == "H" |
+    gs_subcat %in% c(
+      "CP:PID",
+      "CP:KEGG"
+      # "CP:REACTOME"
+      # "GO:BP",
+      # "GO:MF"
+    )
+  )
+
+msigdbr_of_interest_gs <- msigdbr_of_interest %>%
+  group_by(gs_name) %>%
+  summarize(
+    gs = list(ensembl_gene),
+    .groups = "drop"
+  ) %>%
+  with(
+    set_names(
+      gs,
+      gs_name
+    )
+  )
 
 ```
 
+## FGSEA
+
+###
+
+Linear scale most rescued by agent to most not rescued. Only including
+genes perturbed by PTX
+
+Options
+
+1. Order genes by magnitude of rescue in Agent + PTX vs PTX but clamp log2FC to
+  magnitude of change in PTX vs DMSO
+  i. By signed padj
+  ii. By log2FC
+2.
+
+
+```{r}
+library(fgsea)
+
+fgsea_rescue_vectors <- ptx_rescue_by_compound %>%
+  filter(perturbed != "not perturbed") %>%
+  mutate(
+    signed_padj_rescue_raw = if_else(
+      !xor(signed_padj > 0, `signed_padj + PTX vs PTX` > 0),
+      0,
+      `signed_padj + PTX vs PTX`
+    ),
+    logFC_rescue_raw = if_else(
+      !xor(logFC > 0, `logFC + PTX vs PTX` > 0),
+      0,
+      `logFC + PTX vs PTX`
+    ),
+    signed_padj_rescue_clamped = if_else(
+      abs(signed_padj_rescue_raw) > abs(signed_padj),
+      sign(signed_padj_rescue_raw) * abs(signed_padj),
+      signed_padj_rescue_raw
+    ),
+    logFC_rescue_clamped = if_else(
+      abs(logFC_rescue_raw) > abs(logFC),
+      sign(logFC_rescue_raw) * abs(logFC),
+      logFC_rescue_raw
+    ),
+    signed_padj_raw = `signed_padj + PTX vs PTX`,
+    logFC_raw = `logFC + PTX vs PTX`
+  )
+
+fgsea_rescue_vectors_long <- fgsea_rescue_vectors %>%
+  select(
+    gene_id,
+    compound,
+    contains("rescue"),
+    ends_with("raw")
+  ) %>%
+  pivot_longer(
+    -c(gene_id, compound),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+
+fgsea_rescue_vectors_grouped <- fgsea_rescue_vectors_long %>%
+  group_by(metric, compound) %>%
+  summarize(
+    gene_stats = set_names(
+      value, gene_id
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+fgsea_rescue_vectors_res_raw <- fgsea_rescue_vectors_grouped %>%
+  rowwise() %>%
+  mutate(
+    res = fgseaMultilevel(
+      msigdbr_of_interest_gs,
+      gene_stats,
+      BPPARAM = BiocParallel::MulticoreParam(workers = 6)
+    ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+fgsea_rescue_vectors_res <- fgsea_rescue_vectors_res_raw %>%
+  dplyr::select(-gene_stats) %>%
+  unnest(res)
+
+qsave(
+  fgsea_res,
+  "vemu/fgsea_res.qs"
+)
+```
+
+```{r}
+library(seriation)
+cluster_mat <- function(mat) {
+  d <- dist(mat)
+  set.seed(42)
+  hclust(d, method = "average") %>%
+    seriation:::reorder.hclust(dist = d, method = "olo")
+}
+
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    dplyr::select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+```
+
+
+```{r}
+fgsea_res_mat <- fgsea_res %>%
+  transmute(comparison_unique, pathway, signed_padj = -sign(NES)*log10(padj)) %>%
+  pivot_wider(
+    names_from = comparison_unique,
+    values_from = signed_padj
+  ) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix() %>% {
+    clust_rows <- cluster_mat(.)
+    clust_cols <- cluster_mat(t(.))
+    .[clust_rows$order, clust_cols$order]
+  }
+
+library(cmapR)
+fgsea_res_gct <- new(
+  "GCT",
+  mat = fgsea_res_mat,
+  rdesc = msigdbr_of_interest %>%
+    distinct(
+      id = gs_name,
+      gs_cat, gs_subcat
+    ) %>%
+    dplyr::slice(match(rownames(fgsea_res_mat), id)) %>%
+    as.data.frame(),
+  cdesc = fgsea_gene_stats %>%
+    distinct(
+      id = comparison_unique,
+      comparison_type
+    ) %>%
+    dplyr::slice(match(colnames(fgsea_res_mat), id)) %>%
+    as.data.frame()
+)
+
+write_gct(
+  fgsea_res_gct,
+  "vemu/fgsea_res_h_pid_kegg.gct",
+  appenddim = FALSE
+)
+```
+
+## topGO
+
+```{r}
+library(topGO)
+
+ptx_rescue_gene_sets <- ptx_rescue_by_compound %>%
+  mutate(
+    return_baseline = case_when(
+      perturbed == "not perturbed" ~ "not perturbed",
+      `FDR + PTX` > .05 ~ "yes",
+      `FDR + PTX` <= .05 ~ "no",
+      TRUE ~ NA_character_
+    ),
+    significant_opposite = case_when(
+      perturbed == "not perturbed" ~ "not perturbed",
+      perturbed == "up" & `FDR + PTX vs PTX` <= .05 & `logFC + PTX vs PTX` < 0 ~ "yes",
+      perturbed == "down" & `FDR + PTX vs PTX` <= .05 & `logFC + PTX vs PTX` > 0 ~ "yes",
+      TRUE ~ "no"
+    ),
+    overshot = case_when(
+      is.na(perturbed) | perturbed == "not perturbed" ~ "not perturbed",
+      perturbed == "up" & `FDR + PTX` <= .05 & `logFC + PTX` < 0 ~ "yes",
+      perturbed == "down" & `FDR + PTX` <= .05 & `logFC + PTX` > 0 ~ "yes",
+      TRUE ~ "no"
+    )
+  )
+
+ptx_rescue_gene_sets_short <- bind_rows(
+  ptx_rescue_gene_sets %>%
+    dplyr::select(
+      gene_id, compound, perturbed, return_baseline, significant_opposite, overshot
+    ) %>%
+    filter(perturbed != "not perturbed") %>%
+    pivot_longer(
+      -c(gene_id, compound, perturbed),
+      names_to = "rescue_definition",
+      values_to = "rescue"
+    ) %>%
+    filter(rescue == "yes"),
+  ptx_rescue_gene_sets %>%
+    distinct(
+      gene_id, perturbed,
+      rescue_definition = "perturbed",
+      rescue = if_else(
+        perturbed == "not perturbed",
+        "no",
+        "yes"
+      )
+    ) %>%
+    mutate(compound = "PTX") %>%
+    filter(rescue == "yes")
+)
+
+ptx_rescue_gene_sets %>%
+  dplyr::count(
+    compound, perturbed,
+    return_baseline, significant_opposite, overshot
+  ) %>%
+  View()
+```
+
+
+```{r}
+ptx_rescue_2_plot_data <- ptx_rescue_plot_data %>%
+  mutate(
+    across(
+      contrast_2, \(x) str_remove(x, fixed(" + PTX"))
+    )
+  ) %>%
+  semi_join(
+    feasible_genes,
+    by = "gene_id"
+  ) %>%
+  power_left_join(
+    ptx_rescue_gene_sets_short %>%
+      filter(compound != "PTX") %>%
+      mutate(
+        gene_id = factor(gene_id, levels = feasible_genes$gene_id)
+      ) %>%
+      complete(gene_id, compound, perturbed, rescue_definition, fill = list(rescue = "no")),
+    by = c("gene_id", "contrast_2" = "compound")
+  )
+
+p <- ptx_rescue_2_plot_data %>%
+  arrange(rescue) %>%
+  ggplot(
+    aes(
+      x = logFC_1,
+      y = logFC_2,
+      color = rescue
+    )
+  ) +
+  ggrastr::rasterize(geom_point(
+    alpha = .5, shape = 16
+  ), dpi = 250, dev = "ragg") +
+  scale_color_manual(
+    values = c(yes = "red", no = "black")
+  ) +
+  coord_fixed() +
+  facet_grid(
+    contrast_2  ~ rescue_definition
+  ) +
+  geom_abline(
+    slope = 1, intercept = 0,
+    color = "gray", linetype = "dashed"
+  ) +
+  labs(
+    x = "log2(FC) PTX vs DMSO",
+    y = "log2(FC) Compound + PTX vs PTX",
+    color = "Rescue"
+  )
+
+ggsave(
+  file.path("plots", "ptx_rescue_2_plot.pdf"),
+  p, width = 12, height = 8
+)
+```
+
+1. Use significant opposite rscue edfinition
+2. Define PTX, GNE, JNK effects alone using GO enrichment
+3. Make tables of GO enrichment of the GNE/JNK rescue gene sets,
+4. Include GNE-only and JNK-only rescue gene sets
+5. Make two big heatmaps of gene expression, group by PTX up/down, JNK/GNE rescue
+6. Make TF enrichment for just raw JNK/GNE effects
+
+
+```{r}
+feasible_gene_vec <- feasible_genes %>%
+  filter(feasible) %>%
+  pull(gene_id)
+
+ptx_rescue_gene_sets_list <- ptx_rescue_gene_sets_short %>%
+  group_by(
+    compound, perturbed, rescue_definition
+  ) %>%
+  summarize(
+    gene_vec = list(
+      set_names(
+        # factor(as.integer(feasible_gene_vec %in% gene_id)),
+        if_else(feasible_gene_vec %in% gene_id, .01, 1),
+        feasible_gene_vec
+      )
+    ),
+    .groups = "drop"
+  )
+
+gene_sel_fun <- \(x) x < .05
+
+topgo_objects <- c("BP", "MF", "CC") %>%
+  set_names() %>%
+  map(
+    \(x) new(
+      "topGOdata",
+      ontology = x,
+      allGenes = ptx_rescue_gene_sets_list$gene_vec[[1]],
+      geneSel = gene_sel_fun,
+      nodeSize = 10,
+      annot = annFUN.org,
+      ID = "ensembl",
+      mapping = "org.Hs.eg.db"
+    )
+  )
+
+qsave(
+  topgo_objects,
+  "topgo_objects.qs"
+)
+topgo_objects <- qread("topgo_objects.qs")
+
+go_gene_map <- map(
+  topgo_objects,
+  \(x) x@graph@nodes %>%
+    set_names() %>%
+    map(\(y) genesInTerm(x, y)[[1]])
+) %>%
+  # unlist(recursive = FALSE)
+  {do.call(c, .)}
+
+qsave(
+  go_gene_map,
+  "go_gene_map.qs"
+)
+go_gene_map <- qread("go_gene_map.qs")
+
+topgo_res_raw <- ptx_rescue_gene_sets_list %>%
+  crossing(
+    ontology = names(topgo_objects)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    res = {
+      go <- updateGenes(
+        topgo_objects[[ontology]],
+        geneList = gene_vec,
+        geneSelFun = gene_sel_fun
+      )
+      # browser()
+      raw <- runTest(
+        go,
+        algorithm = "weight01",
+        statistic = "fisher"
+      )
+      res_table <- GenTable(
+        go,
+        fisher = raw,
+        topNodes = length(usedGO(go)),
+        numChar = 300
+      )
+      list(
+        res_raw = raw,
+        res = res_table
+      ) %>%
+        list()
+    }
+  ) %>%
+  ungroup()
+
+qsave(
+  topgo_res_raw,
+  "topgo_res_raw.qs"
+)
+topgo_res_raw <- qread("topgo_res_raw.qs")
+
+topgo_res <- topgo_res_raw %>%
+  rowwise() %>%
+  mutate(
+    res_table = list(res[["res"]])
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-c(res, gene_vec)) %>%
+  unnest(res_table) %>%
+  mutate(
+    term_unique = paste(
+      Term, GO.ID, sep = "_"
+    ),
+    fisher_double = as.double(str_remove(fisher, fixed("< ")))
+  )
+
+qsave(
+  topgo_res,
+  "topgo_res.qs"
+)
+topgo_res <- qread("topgo_res.qs")
+
+go_meta <- topgo_res %>%
+  distinct(
+    ontology, GO.ID, Term, term_unique
+  )
+```
+
+
+```{r}
+topgo_res_plotting <- topgo_res %>%
+  group_by(
+    ontology, term_unique
+  ) %>%
+  filter(any(fisher_double < 0.05)) %>%
+  ungroup() %>%
+  mutate(
+    rescue_type = paste(perturbed, compound, rescue_definition, sep = "_")
+  )
+
+topgo_res_plotting_clust <- topgo_res_plotting %>%
+  dplyr::transmute(ontology, term_unique, rescue_type, across(fisher_double, \(x) -log10(x))) %>%
+  group_nest(ontology) %>%
+  mutate(
+    data = map(
+      data,
+      \(x) cluster_df(x, term_unique, rescue_type, fisher_double)
+    )
+  ) %>%
+  with(set_names(data, ontology))
+
+plot_big_heatmap <- \(x, df) ggplot(
+  df %>%
+    mutate(
+      perturbed = factor(perturbed, levels = c("up", "down")),
+      compound = factor(compound, levels = c("PTX", "JNK-inh", "GNE-495")),
+      rescue_definition = factor(rescue_definition, levels = c("return_baseline", "significant_opposite", "overshot")),
+      across(term_unique, \(y) factor(y, levels = levels(topgo_res_plotting_clust[[x]]$term_unique)) %>% fct_relabel(\(z) str_sub(z, 1, 50))),
+    ) %>%
+    arrange(perturbed, compound, rescue_definition) %>%
+    mutate(
+      across(
+        rescue_type, fct_inorder
+      )
+    ),
+  aes(
+    x = rescue_type,
+    y = term_unique,
+    fill = fisher_double
+  )
+) +
+  geom_raster() +
+  ggplot2::scale_fill_gradientn(
+    colours = rev(c("#2166ac", "#d1e5f0", "#fddbc7", "#b2182b")),
+    limits = c(quantile(topgo_res_plotting$fisher_double, .01), 1),
+    values = scales::rescale(log10(c(quantile(topgo_res_plotting$fisher_double, .01), 0.04999, 0.05, 1))),
+    oob = scales::squish,
+    # labels = c("p > 0.05", "p = 0.05", "p <= 0.05"),
+    trans = "log10"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+  # scale_fill_viridis_c(direction = -1, trans = "log10")
+
+ps <- map(
+  names(topgo_res_plotting_clust) %>%
+    set_names(),
+  \(x, y) plot_big_heatmap(x, topgo_res_plotting)
+)
+
+iwalk(
+  ps,
+  \(p, name) {
+    ggsave(
+      file.path("plots", paste0("topgo_big_heatmap_", name, "2.pdf")),
+      p, width = 12, height = 30
+    )
+  }
+)
+
+ggsave(
+  "topgo_test.pdf", p,
+  width = 12, height = 30
+)
+
+topgo_res_plotting_picks <- topgo_res_plotting %>%
+  mutate(
+    signif = fisher_double < .05
+  ) %>%
+  group_by(
+    ontology, GO.ID
+  ) %>%
+  filter(
+    is_empty(
+      setdiff(c("GNE-495", "PTX"), compound[signif])
+    ) | is_empty(
+      setdiff(c("JNK-inh", "PTX"), compound[signif])
+    )
+  ) %>%
+  ungroup()
+
+
+ps <- map(
+  names(topgo_res_plotting_clust) %>%
+    set_names(),
+  \(x, y) plot_big_heatmap(x, topgo_res_plotting_picks)
+)
+
+iwalk(
+  ps,
+  \(p, name) {
+    ggsave(
+      file.path("plots", paste0("topgo_big_heatmap_picks_", name, "2.pdf")),
+      p, width = 12, height = 35
+    )
+  }
+)
+```
+
+
+
+
+```{r}
+topgo_res_plotting_picks_mat <- topgo_res_plotting_picks %>%
+  mutate(
+    perturbed = factor(perturbed, levels = c("up", "down")),
+    compound = factor(compound, levels = c("PTX", "JNK-inh", "GNE-495")),
+    rescue_definition = factor(rescue_definition, levels = c("return_baseline", "significant_opposite", "overshot")),
+    across(term_unique, \(x) factor(x, levels = levels(topgo_res_plotting_clust$term_unique))),
+  ) %>%
+  arrange(perturbed, compound, rescue_definition) %>%
+  mutate(
+    across(
+      rescue_type, fct_inorder
+    )
+  ) %>%
+  transmute(GO.ID, across(fisher_double, log10), rescue_type) %>%
+  pivot_wider(
+    names_from = rescue_type,
+    values_from = fisher_double
+  ) %>%
+  column_to_rownames("GO.ID") %>%
+  as.matrix()
+
+topgo_res_plotting_picks_dist <- dist(topgo_res_plotting_picks_mat)
+topgo_res_plotting_picks_clust <- hclust(topgo_res_plotting_picks_dist, method = "average") %>%
+  reorder(topgo_res_plotting_picks_dist, method = "olo")
+
+ss <- map_dbl(
+  2:50,
+  \(k) {
+    x <- cutree(topgo_res_plotting_picks_clust, k = k) %>%
+      silhouette(topgo_res_plotting_picks_dist)
+    mean(x[, 3])
+  }
+)
+```
+
+```{r}
+createAnnotation <- function(df, colors = list(), which = "column") {
+  # Load necessary libraries
+  color_maps <- list()
+
+  # Iterate over each column in the dataframe
+  for (col_name in names(df)) {
+    # Check if the column is numeric
+    if (is.numeric(df[[col_name]])) {
+      # Create a color mapping function for numeric columns
+      if (is.null(colors[[col_name]]))
+        colors[[col_name]] <- c("white", "red")
+      if (is.function(colors[[col_name]])) {
+        col_fun <- colors[[col_name]]
+      } else if (is.character(colors[[col_name]])) {
+        n <- length(colors[[col_name]])
+        if (n == 1) {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 100),
+            viridis(100, option = colors[[col_name]])
+          )
+        } else {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = n),
+            colors[[col_name]]
+          )
+        }
+      } else
+        stop("Dont know how to handle colors for column ", col_name)
+      color_maps[[col_name]] <- col_fun
+    } else {
+      if (is.character(colors[[col_name]])) {
+        color_maps[[col_name]] <- colors[[col_name]]
+        next
+      }
+      col_fun <- colors[[col_name]] %||% rainbow
+      # Create a named vector of colors for categorical columns
+      values <- df[[col_name]]
+      unique_values <- if (is.factor(values)) levels(values) else unique(df[[col_name]])
+      named_colors <- setNames(col_fun(length(unique_values)), unique_values)
+      color_maps[[col_name]] <- named_colors
+    }
+  }
+
+  # Combine all annotations
+  combined_annotations <- HeatmapAnnotation(df = df, col = color_maps, which = which)
+
+  return(combined_annotations)
+}
+```
+
+
+```{r}
+library(ComplexHeatmap)
+library(viridisLite)
+
+clust_cut <- cutree(topgo_res_plotting_picks_clust, k = 12)
+
+hm_df <- enframe(clust_cut, name = "GO.ID", value = "cluster") %>%
+  mutate(across(cluster, \(x) fct_inseq(as.character(x)))) %>%
+  column_to_rownames("GO.ID")
+
+hm <- Heatmap(
+  topgo_res_plotting_picks_mat,
+  name = "p-value",
+  cluster_rows = topgo_res_plotting_picks_clust,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  left_annotation = createAnnotation(hm_df, which = "row"),
+  col = circlize::colorRamp2(
+    log10(c(quantile(topgo_res_plotting$fisher_double, .01), 0.04999, 0.05, 1)),
+    rev(c("#2166ac", "#d1e5f0", "#fddbc7", "#b2182b"))
+  )
+)
+
+  ggplot2::scale_fill_gradientn(
+    colours = rev(c("#2166ac", "#d1e5f0", "#fddbc7", "#b2182b")),
+    limits = c(quantile(topgo_res_plotting$fisher_double, .01), 1),
+    values = scales::rescale(log10(c(quantile(topgo_res_plotting$fisher_double, .01), 0.04999, 0.05, 1))),
+    oob = scales::squish,
+    # labels = c("p > 0.05", "p = 0.05", "p <= 0.05"),
+    trans = "log10"
+  ) +
+```
+
+
+```{r}
+compound_specific_go_rescue <- topgo_res %>%
+  group_by(
+    GO.ID, Term, term_unique, perturbed
+  ) %>%
+  filter(
+    fisher_double[compound == "PTX"] < .05
+  ) %>%
+  summarize(
+    compound_rescues = case_when(
+      any(fisher_double[compound == "GNE-495"] < .05) & any(fisher_double[compound == "JNK-inh"] < .05) ~ "both",
+      any(fisher_double[compound == "GNE-495"] < .05) ~ "GNE-495",
+      any(fisher_double[compound == "JNK-inh"] < .05) ~ "JNK-inh",
+      TRUE ~ "none"
+    ),
+    rescue_definitions = paste(sort(rescue_definition[fisher_double < .05]), collapse = ", "),
+    .groups = "drop"
+  )
+
+compound_specific_go_rescue %>%
+  dplyr::count(perturbed, compound_rescues)
+```
+
+
+
+```{r}
+picked_clusters <- "chondrocyte proliferation_GO:0035988
+negative regulation of ubiquitin−protein transferase activity_GO:0051444
+temperature homeostasis_GO:0001659
+chondrocyte differentiation_GO:0002062
+cardiac left ventricle morphogenesis_GO:0003214
+negative regulation of ubiquitin−dependent protein catabolic process_GO:2000059
+negative regulation of G1/S transition of mitotic cell cycle_GO:2000134
+positive regulation of stem cell proliferation_GO:2000648
+endoderm development_GO:0007492
+negative regulation of cell−matrix adhesion_GO:0001953
+neural crest cell differentiation_GO:0014033
+presynaptic membrane organization_GO:0097090
+negative regulation of wound healing_GO:0061045
+ventricular septum morphogenesis_GO:0060412
+axon extension involved in axon guidance_GO:0048846
+aorta morphogenesis_GO:0035909
+negative regulation of apoptotic process_GO:0043066
+regulation of basement membrane organization_GO:0110011
+hippo signaling_GO:0035329
+formation of cytoplasmic translation initiation complex_GO:0001732" %>%
+  str_match_all(
+    "(GO:[0-9]+)"
+  )
+
+
+printGenes(
+  topgo_objects[["BP"]],
+  picked_clusters[[1]][, 1],
+
+)
+```
+
+
+```{r}
+# single type per gene
+ptx_rescue_type_list_single <- ptx_rescue_type_list %>%
+  filter(rescue_definition %in% c("significant_opposite", "return_baseline")) %>%
+  group_by(gene_id) %>%
+  arrange(
+    gene_id,
+    match(
+      rescue_type, c("both", "JNK-inh only", "GNE-495 only", "no rescue", "not perturbed")
+    )
+  ) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+plot_gene_set <- function(selected_genes) {
+  condition_order <- c(
+    "DMSO" = "DMSO", "PTX" = "PTX",
+    "JNKinhPTX" = "PTX + JNK-Inh", "GNE495PTX" = "PTX + GNE-495",
+    "JNKinhDMSO" = "JNK-Inh", "GNE495DMSO" = "GNE-495"
+  )
+  df <- rlog_scaled2[intersect(selected_genes, rownames(rlog_scaled2)), ] %>%
+    as_tibble(rownames = "gene_id") %>%
+    pivot_longer(
+      -gene_id,
+      names_to = "sample_id",
+      values_to = "value"
+    ) %>%
+    power_inner_join(
+      de_meta,
+      by = "sample_id",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
+    power_inner_join(
+      ptx_rescue_type_list_single,
+      by = "gene_id",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
+    power_inner_join(
+      gene_id_gene_symbol_map,
+      by = "gene_id",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
+    mutate(
+      condition = factor(recode(condition, !!!condition_order), levels = unname(condition_order)),
+    )
+  # browser()
+  ggplot(
+    df,
+    aes(
+      x = condition,
+      y = value,
+      color = rescue_type
+    )
+  ) +
+    ggbeeswarm::geom_quasirandom(
+      aes(
+        group = rescue_type,
+        text = paste0(
+          gene_name, " (", gene_id, ")\n",
+          "Rescue type: ", rescue_type, "\n",
+          "Condition: ", condition, "\n",
+          "Expression: ", signif(value, 2),
+          " (", sample_id, ")"
+        )
+      ),
+      shape = 16, dodge.width = .8
+    ) +
+    scale_color_manual(
+      values = rescue_type_colors
+    ) +
+    geom_boxplot(
+      fill = NA,
+      outlier.shape = NA,
+      position = position_dodge(width = .8)
+    ) +
+    labs(
+      x = NULL, y = "Scaled expression",
+      color = "Rescue type"
+    )
+    # scale_color_manual(
+    #   values = c("highlighted" = "red", "background" = "gray50")
+    # )
+}
+
+
+plot_go_set <- function(go_id) {
+  gene_set <- go_gene_map[[paste0("BP.", go_id)]]
+  plot_gene_set(gene_set) +
+    labs(
+      title = go_meta %>%
+        filter(GO.ID == go_id) %>%
+        pull(Term) %>%
+        paste0(., " (", go_id, ")")
+    )
+}
+
+p <- plot_go_set("GO:0097090")
+
+ggsave(
+  "plots/scaled_expression_presynaptic_membrane_organization.pdf",
+  p, width = 8, height = 6
+)
+
+plotly::ggplotly(p, tooltip = "text") %>%
+  plotly::layout(boxmode = "group") %>%
+  htmlwidgets::saveWidget(
+    "plots/scaled_expression_presynaptic_membrane_organization.html",
+    selfcontained = TRUE
+  )
+
+example_go <- "GO:0097090"
+example_background <- go_gene_map[[paste0("BP.", "GO:0097090")]]
+
+p <- plot_gene_set(example_background) +
+  labs(
+    title = go_meta %>%
+      filter(GO.ID == example_go) %>%
+      pull(Term) %>%
+      paste0(., " (", example_go, ")")
+  )
+
+plotly::ggplotly(p, tooltip = "text") %>%
+  plotly::layout(boxmode = "group")
+
+p <- plot_go_set("GO:0070527")
+
+ggsave(
+  "plots/scaled_expression_platelet_aggregation.pdf",
+  p, width = 8, height = 6
+)
+plotly::ggplotly(p, tooltip = "text") %>%
+  plotly::layout(boxmode = "group") %>%
+  htmlwidgets::saveWidget(
+    "plots/scaled_expression_platelet_aggregation.html",
+    selfcontained = TRUE
+  )
+```
+
+
+```{r}
+library(ComplexHeatmap)
+plot_gene_set_hm <- function(selected_genes) {
+  condition_order <- c(
+    "DMSO" = "DMSO", "PTX" = "PTX",
+    "JNKinhPTX" = "PTX + JNK-Inh", "GNE495PTX" = "PTX + GNE-495",
+    "JNKinhDMSO" = "JNK-Inh", "GNE495DMSO" = "GNE-495"
+  )
+  col_meta <- de_meta %>%
+    mutate(
+      condition = factor(recode(condition, !!!condition_order), levels = unname(condition_order))
+    ) %>%
+    arrange(condition, sample_id)
+
+  selected_available_genes <- intersect(selected_genes, rownames(rlog_scaled2))
+  row_meta <- ptx_rescue_type_list_single %>%
+    filter(gene_id %in% selected_available_genes) %>%
+    power_inner_join(
+      gene_id_gene_symbol_map,
+      by = "gene_id",
+      check = check_specs(
+        unmatched_keys_left = "warn",
+        duplicate_keys_right = "warn"
+      )
+    ) %>%
+    dplyr::select(
+      gene_id, gene_name, rescue_type
+    )
+
+  mat <- rlog_scaled2[row_meta$gene_id, col_meta$sample_id]
+  rownames(mat) <- row_meta$gene_name
+
+  Heatmap(
+    mat,
+    name = "Scaled expression",
+    cluster_rows = cluster_mat,
+    cluster_columns = FALSE,
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    column_split = col_meta$condition,
+    left_annotation = HeatmapAnnotation(
+      df = row_meta %>%
+        dplyr::select(gene_name, rescue_type) %>%
+        column_to_rownames("gene_name"),
+      col = list(
+        rescue_type = rescue_type_colors
+      ),
+      which = "row"
+    )
+  )
+}
+
+
+plot_go_set_hm <- function(go_id) {
+  gene_set <- go_gene_map[[paste0("BP.", go_id)]]
+  plot_gene_set_hm(gene_set)
+}
+
+hm <- plot_go_set_hm("GO:0097090")
+
+hm <- plot_go_set_hm("GO:0070527")
+```
+
+
+## gProfiler2
+
+```{r}
+library(gprofiler2)
+
+gprofiler_input <- ptx_rescue_gene_sets_short %>%
+  mutate(
+    gene_set_name = paste(
+      rescue_definition, compound, perturbed, sep = "_"
+    )
+  ) %>%
+  power_left_join(
+    distinct(de_long, gene_id, gene_name),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  group_by(compound, perturbed, rescue_definition, gene_set_name) %>%
+  summarize(
+    gene_ids = list(gene_id),
+    gene_names = list(gene_name),
+    .groups = "drop"
+  )
+
+gprofiler_res_raw <- gost(
+  with(
+    gprofiler_input,
+    set_names(
+      gene_ids,
+      gene_set_name
+    )
+  ),
+  significant = FALSE
+)
+
+qsave(
+  gprofiler_res_raw,
+  "gprofiler_res_raw.qs"
+)
+gprofiler_res_raw <- qread("gprofiler_res_raw.qs")
+
+# gostplot(gprofiler_res_raw)
+
+gprofiler_res <- gprofiler_res_raw$result %>%
+  as_tibble() %>%
+  dplyr::rename(gene_set_name = query) %>%
+  power_inner_join(
+    gprofiler_input %>%
+      dplyr::select(compound, perturbed, rescue_definition, gene_set_name),
+    by = "gene_set_name",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+
+
+```{r}
+gprofiler_res %>%
+  count(source)
+
+gprofiler_plotting_res_tf <- gprofiler_res %>%
+  filter(
+    source == "TF"
+  ) %>%
+  group_by(
+    term_id
+  ) %>%
+  filter(any(p_value < .05)) %>%
+  ungroup() %>%
+  mutate(
+    rescue_type = paste(perturbed, compound, rescue_definition, sep = "_")
+  )
+
+plot_big_heatmap_gprofiler <- \(df, y_var, fill_var, log_trans = FALSE) {
+  df_clust <- df %>%
+    dplyr::transmute(rescue_type, {{y_var}}, if (log_trans) across({{fill_var}}, \(x) -log10(x)) else {{fill_var}}) %>%
+    cluster_df({{y_var}}, rescue_type, {{fill_var}})
+  df_trans <- df %>%
+    mutate(
+      perturbed = factor(perturbed, levels = c("up", "down")),
+      compound = factor(compound, levels = c("PTX", "JNK-inh", "GNE-495")),
+      rescue_definition = factor(rescue_definition, levels = c("return_baseline", "significant_opposite", "overshot")),
+      across({{y_var}}, \(y) factor(y, levels = levels(pull(df_clust, {{y_var}}))) %>% fct_relabel(\(z) str_sub(z, 1, 50))),
+    ) %>%
+    arrange(perturbed, compound, rescue_definition) %>%
+    mutate(
+      across(
+        rescue_type, fct_inorder
+      )
+    )
+  ggplot(
+    df_trans,
+    aes(
+      x = rescue_type,
+      y = {{y_var}},
+      fill = {{fill_var}}
+    )
+  ) +
+    geom_raster() +
+    scale_fill_viridis_c(direction = -1) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+}
+
+plot_big_heatmap_gprofiler_pval <- \(df, y_var, fill_var) {
+  p_val_scale <- ggplot2::scale_fill_gradientn(
+    colours = rev(c("#2166ac", "#d1e5f0", "#fddbc7", "#b2182b")),
+    limits = c(quantile(pull(df, {{fill_var}}), .01), 1),
+    values = scales::rescale(log10(c(quantile(pull(df, {{fill_var}}), .01), 0.04999, 0.05, 1))),
+    oob = scales::squish,
+    # labels = c("p > 0.05", "p = 0.05", "p <= 0.05"),
+    trans = "log10"
+  )
+  plot_big_heatmap_gprofiler(df, {{y_var}}, {{fill_var}}, log_trans = TRUE) + p_val_scale
+}
+  # scale_fill_viridis_c(direction = -1, trans = "log10")
+
+p <- plot_big_heatmap_gprofiler_pval(gprofiler_plotting_res_tf, TF, p_value)
+
+gprofiler_plotting_res_tf_combined <- gprofiler_plotting_res_tf %>%
+  separate_wider_regex(
+    term_name,
+    c("Factor: ", TF = "[^;]+", "; motif: ", motif = "[^;]+", ";?.*")
+  ) %>%
+  group_by(
+    TF, compound, perturbed, rescue_definition, rescue_type
+  ) %>%
+  summarize(
+    p_value = psych::harmonic.mean(p_value),
+    .groups = "drop"
+  )
+
+
+p <- plot_big_heatmap_gprofiler_pval(gprofiler_plotting_res_tf_combined, TF, p_value)
+
+ggsave(
+  "plots/gprofiler_hm_tf_combined.pdf",
+  p, width = 8, height = 25
+)
+# SCRT1
+
+chea3_res %>%
+  filter(TF == "SCRT1") %>%
+  View()
+```
+
+
+
+```{r}
+chea3_submit <- function(N  , name = "myquery") {
+  library(httr)
+  library(jsonlite)
+
+  url <- "https://maayanlab.cloud/chea3/api/enrich/"
+  payload <- list(
+    query_name = name,
+    gene_set = genes
+  )
+
+  response <- POST(url = url, body = payload, encode = "json")
+  json <- content(response, "text")
+
+  fromJSON(json)
+}
+
+chea3_res_raw <- gprofiler_input %>%
+  mutate(
+    res = map(
+      gene_names,
+      \(x) {
+        res <- chea3_submit(x)
+        Sys.sleep(3)
+        res
+      }
+    )
+  )
+
+qsave(
+  chea3_res_raw,
+  "chea3_res_raw.qs"
+)
+
+chea3_res <- chea3_res_raw %>%
+  mutate(
+    res = map(
+      res,
+      \(x) bind_rows(x, .id = "table")
+    )
+  ) %>%
+  select(-gene_ids, -gene_names) %>%
+  unnest(res)
+
+write_csv(
+  chea3_res,
+  "chea3_res.csv.gz"
+)
+chea3_res <- read_csv("chea3_res.csv.gz")
+```
+
+
+```{r}
+chea3_res %>%
+  distinct(table)
+
+chea3_res %>%
+  filter(table == "Integrated--meanRank") %>%
+  pull(Score) %>%
+  hist()
+
+
+chea3_res_plotting_integrated_mean <- chea3_res %>%
+  filter(
+    table == "Integrated--meanRank"
+  ) %>%
+  group_by(
+    TF
+  ) %>%
+  filter(any(Score < 100)) %>%
+  ungroup() %>%
+  mutate(
+    rescue_type = paste(perturbed, compound, rescue_definition, sep = "_")
+  )
+
+chea3_res_plotting_remap <- chea3_res %>%
+  filter(
+    table == "ReMap--ChIP-seq"
+  ) %>%
+  group_by(
+    TF
+  ) %>%
+  filter(any(FDR < 0.05)) %>%
+  ungroup() %>%
+  mutate(
+    rescue_type = paste(perturbed, compound, rescue_definition, sep = "_")
+  )
+
+
+chea3_res_plotting_encode <- chea3_res %>%
+  filter(
+    table == "ENCODE--ChIP-seq"
+  ) %>%
+  group_by(
+    TF
+  ) %>%
+  filter(any(FDR < 0.05)) %>%
+  ungroup() %>%
+  mutate(
+    rescue_type = paste(perturbed, compound, rescue_definition, sep = "_")
+  )
+
+
+
+plot_big_heatmap_chea3 <- \(df, fill_var) {
+  df_clust <- df %>%
+    dplyr::transmute(rescue_type, TF, {{fill_var}}) %>%
+    cluster_df(TF, rescue_type, {{fill_var}})
+  df_trans <- df %>%
+    mutate(
+      perturbed = factor(perturbed, levels = c("up", "down")),
+      compound = factor(compound, levels = c("PTX", "JNK-inh", "GNE-495")),
+      rescue_definition = factor(rescue_definition, levels = c("return_baseline", "significant_opposite", "overshot")),
+      across(TF, \(y) factor(y, levels = levels(df_clust$TF)) %>% fct_relabel(\(z) str_sub(z, 1, 50))),
+    ) %>%
+    arrange(perturbed, compound, rescue_definition) %>%
+    mutate(
+      across(
+        rescue_type, fct_inorder
+      )
+    )
+  ggplot(
+    df_trans,
+    aes(
+      x = rescue_type,
+      y = TF,
+      fill = {{fill_var}}
+    )
+  ) +
+    geom_raster() +
+    scale_fill_viridis_c(direction = -1) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+}
+
+plot_big_heatmap_chea3_pval <- \(df, fill_var) {
+  p_val_scale <- ggplot2::scale_fill_gradientn(
+    colours = rev(c("#2166ac", "#d1e5f0", "#fddbc7", "#b2182b")),
+    limits = c(quantile(pull(df, {{fill_var}}), .01), 1),
+    values = scales::rescale(log10(c(quantile(pull(df, {{fill_var}}), .01), 0.04999, 0.05, 1))),
+    oob = scales::squish,
+    # labels = c("p > 0.05", "p = 0.05", "p <= 0.05"),
+    trans = "log10"
+  )
+  plot_big_heatmap_chea3(df, {{fill_var}}) + p_val_scale
+}
+  # scale_fill_viridis_c(direction = -1, trans = "log10")
+
+p <- plot_big_heatmap_chea3(chea3_res_plotting_integrated_mean, Score)
+p
+
+ggsave(
+  "plots/chea3_hm_integrated_mean.pdf",
+  p +
+    scale_fill_viridis_c(direction = -1, trans = "log10"), width = 8, height = 15
+)
+
+p <- plot_big_heatmap_chea3_pval(chea3_res_plotting_remap, FDR)
+
+
+ggsave(
+  "plots/chea3_hm_remap.pdf",
+  p,
+  width = 8, height = 15
+)
+
+p <- plot_big_heatmap_chea3_pval(chea3_res_plotting_encode, FDR)
+
+ggsave(
+  "plots/chea3_hm_encode.pdf",
+  p,
+  width = 8, height = 15
+)
+
+# SCRT1
+
+chea3_res %>%
+  filter(TF == "SCRT1") %>%
+  View()
+```
 
 
 ```{r}
