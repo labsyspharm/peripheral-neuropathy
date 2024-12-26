@@ -1,0 +1,671 @@
+---
+title: "Peripheral neuropathy gene set analysis plotting"
+author: "Clemens Hug"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+library(plotly)
+library(ggrepel)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Reading GSE results
+
+```{r}
+top_go_res_pert <- syn("syn64461453") %>%
+  qread()
+
+fgsera_res_pert <- syn("syn64461445") %>%
+  qread()
+
+fgsea_res_rescue <- syn("syn64461444") %>%
+  qread()
+```
+
+
+
+## Plot Reactome PTX only and comparison with combination treatment
+
+
+```{r}
+fgsera_res_single_treatments <- fgsera_res_pert %>%
+  filter(
+    metric == "signed_padj"
+  ) %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  filter(
+    database == "REACTOME",
+    padj < 0.01
+  ) %>%
+  mutate(
+    sign = if_else(NES > 0, "pos", "neg")
+  )
+
+ps <- fgsera_res_single_treatments %>%
+  group_nest(
+    contrast
+  ) %>%
+  mutate(
+    p = map2(
+      contrast, data,
+      \(x, y) {
+        y %>%
+          mutate(
+            pathway = fct_reorder(pathway, NES)
+          ) %>%
+          ggplot(
+            aes(
+              x = NES,
+              y = pathway,
+              fill = sign
+            )
+          ) +
+          geom_col() +
+          geom_text(
+            aes(
+              x = if_else(sign == "pos", -.05, .05),
+              hjust = if_else(sign == "pos", 1, 0),
+              label = pathway
+            ),
+            size = 2
+          ) +
+          scale_fill_discrete(guide = "none", direction = -1) +
+          theme(
+            axis.text.y = element_blank(),
+            panel.grid.major.y = element_blank(),
+          ) +
+          labs(
+            x = "Normalized enrichment score",
+            y = NULL,
+            title = paste0("Reactome pathways enriched in ", x, " treatment"),
+            subtitle = "FDR < 0.01"
+          ) + {
+            if (!any(y$sign == "neg"))
+              lims(x = c(-max(abs(y$NES)), NA))
+          }
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast, p, ...) {
+    ggsave(
+      file.path("plots", paste0("reactome_", contrast, "_bars.pdf")),
+      p, width = 8, height = 8
+    )
+  }
+)
+```
+
+### Comparison with combination treatment
+
+```{r}
+fgsera_res_ptx_vs_combo <- fgsera_res_pert %>%
+  filter(
+    metric == "signed_padj"
+  ) %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  mutate(
+    signed_padj = -sign(NES) * log10(padj)
+  ) %>%
+  filter(
+    database == "REACTOME"
+  ) %>% {
+    power_inner_join(
+      filter(., contrast == "PTX"),
+      filter(
+        .,
+        str_ends(contrast, fixed("+ PTX"))
+      ),
+      by = join_by(metric, database, pathway),
+      suffix = c("_ptx", "_combo"),
+      check = check_specs(
+        duplicate_keys_left = "warn",
+        unmatched_keys_left = "warn",
+        unmatched_keys_right = "warn"
+      )
+    )
+  } %>%
+  mutate(
+    sig_class = case_when(
+      padj_ptx < .05 & padj_combo < .05 ~ "both",
+      padj_ptx < .05 ~ "ptx",
+      padj_combo < .05 ~ "combo",
+      TRUE ~ "none"
+    )
+  )
+
+sig_class_colors <- c(
+  "both" = "purple",
+  "ptx" = "red",
+  "combo" = "blue",
+  "none" = "grey"
+)
+
+ps <- fgsera_res_ptx_vs_combo %>%
+  group_nest(contrast_ptx, contrast_combo) %>%
+  mutate(
+    p = map2(
+      contrast_combo, data,
+      \(x, y) {
+        ggplot(
+          y %>%
+            arrange(match(sig_class, names(sig_class_colors))),
+          aes(
+            x = signed_padj_ptx,
+            y = signed_padj_combo
+          )
+        ) +
+        geom_point(
+          aes(
+            color = sig_class,
+            text = pathway
+          ),
+          alpha = .8
+        ) +
+        scale_color_manual(
+          values = sig_class_colors
+        ) +
+        labs(
+          x = paste("Enrichment PTX"),
+          y = paste("Enrichment", x)
+        )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast_ptx, contrast_combo, p, ...) {
+    ggsave(
+      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter_padj.pdf")),
+      p, width = 8, height = 8
+    )
+    htmlwidgets::saveWidget(
+      ggplotly(p),
+      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter_padj.html"))
+    )
+  }
+)
+
+
+ps <- fgsera_res_ptx_vs_combo %>%
+  group_nest(contrast_ptx, contrast_combo) %>%
+  mutate(
+    p = map2(
+      contrast_combo, data,
+      \(x, y) {
+        ggplot(
+          y %>%
+            arrange(match(sig_class, names(sig_class_colors))),
+          aes(
+            x = NES_ptx,
+            y = NES_combo
+          )
+        ) +
+        geom_point(
+          aes(
+            color = sig_class,
+            text = pathway
+          ),
+          alpha = .8
+        ) +
+        scale_color_manual(
+          values = sig_class_colors
+        )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast_ptx, contrast_combo, p, ...) {
+    ggsave(
+      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter.pdf")),
+      p, width = 8, height = 8
+    )
+    htmlwidgets::saveWidget(
+      ggplotly(p),
+      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter.html"))
+    )
+  }
+)
+```
+
+### Highlighting certain pathways
+
+```{r}
+highlighted_pathways <- bind_rows(
+  fgsera_res_ptx_vs_combo %>%
+    filter(
+      signed_padj_ptx > 7
+    ),
+  fgsera_res_ptx_vs_combo %>%
+    filter(
+      signed_padj_combo < -2.5
+    ),
+  fgsera_res_ptx_vs_combo %>%
+    filter(
+      signed_padj_combo > -log10(.05),
+      signed_padj_ptx < log10(.05)
+    )
+) %>%
+  distinct(
+    pathway
+  )
+
+ps <- fgsera_res_ptx_vs_combo %>%
+  group_nest(contrast_ptx, contrast_combo) %>%
+  mutate(
+    p = map2(
+      contrast_combo, data,
+      \(x, y) {
+        ggplot(
+          y %>%
+            arrange(match(sig_class, names(sig_class_colors))),
+          aes(
+            x = signed_padj_ptx,
+            y = signed_padj_combo
+          )
+        ) +
+        geom_point(
+          aes(
+            color = sig_class,
+            text = pathway
+          ),
+          alpha = .8
+        ) +
+        geom_text_repel(
+          data = y %>%
+            mutate(
+              pathway_short = if_else(
+                pathway %in% highlighted_pathways$pathway,
+                pathway,
+                ""
+              )
+            ),
+          aes(
+            label = pathway_short
+          ),
+          size = 2,
+          force = 3,
+          max.iter = 1e6,
+          seed = 42,
+          max.overlaps = Inf,
+          min.segment.length = 0
+        ) +
+        scale_color_manual(
+          values = sig_class_colors
+        ) +
+        scale_x_continuous(
+          expand = expansion(mult = .1)
+        ) +
+        scale_y_continuous(
+          expand = expansion(mult = .1)
+        ) +
+        labs(
+          subtitle = "-sign(NES) * log10(padj)",
+          x = paste("Enrichment PTX"),
+          y = paste("Enrichment", x)
+        )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast_ptx, contrast_combo, p, ...) {
+    ggsave(
+      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter_padj_highlighted.pdf")),
+      p, width = 8, height = 8
+    )
+    # htmlwidgets::saveWidget(
+    #   ggplotly(p),
+    #   file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter_padj.html"))
+    # )
+  }
+)
+```
+
+
+## Heatmap of Reactome PTX and combo
+
+
+```{r}
+
+library(seriation)
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+
+
+cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
+  # if (!sample_in_col) {
+  #   mat <- t(mat)
+  # }
+  # mat_imp <- impute.knn(
+  #   mat, rng.seed = 42
+  # )[["data"]]
+  # if (!sample_in_col) {
+  #   mat_imp <- t(mat_imp)
+  #   mat <- t(mat)
+  # }
+  # browser()
+  dist_mat <- dist(mat)
+  # dist_mat <- as.dist(mat)
+  clust <- hclust(dist_mat, method = "average")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
+```
+
+```{r}
+fgsea_hm_conditions <- c(
+  "PTX", "GNE-495", "JNK-inh",
+  "GNE-495 + PTX", "JNK-inh + PTX"
+)
+
+fgsera_res_pert_hm_data <- fgsera_res_pert %>%
+  filter(
+    metric == "signed_padj",
+    contrast %in% fgsea_hm_conditions
+  ) %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  mutate(
+    signed_padj = -sign(NES) * log10(padj)
+  ) %>%
+  filter(
+    database == "REACTOME"
+  ) %>%
+  cluster_df(
+    pathway, contrast, signed_padj, values_fill = 0
+  )
+
+fgsera_res_pert_mat <- fgsera_res_pert_hm_data %>%
+  arrange(pathway, contrast) %>%
+  select(pathway, contrast, signed_padj) %>%
+  pivot_wider(names_from = contrast, values_from = signed_padj, values_fill = 0) %>%
+  column_to_rownames("pathway") %>%
+  as.matrix()
+
+fgsera_res_pert_hm_pathways <- fgsera_res_pert_hm_data %>%
+  filter(
+    padj < 0.05
+  ) %>%
+  pull(pathway) %>%
+  unique()
+```
+
+
+```{r}
+row_clust <- cluster_fun_eucl(
+  fgsera_res_pert_mat[as.character(fgsera_res_pert_hm_pathways), fgsea_hm_conditions]
+)
+
+row_clust_df_long <- tibble(k = 4:10) %>%
+  mutate(
+    res = map(k, \(x) enframe(cutree(row_clust, k = x), name = "pathway", value = "cluster"))
+  ) %>%
+  unnest(res)
+
+row_clust_df <- row_clust_df_long %>%
+  mutate(
+    cluster = fct_inseq(as.character(cluster))
+  ) %>%
+  pivot_wider(
+    names_from = k,
+    values_from = cluster,
+    names_prefix = "k_"
+  )
+```
+
+k = 7 seems to work well
+
+```{r}
+library(ComplexHeatmap)
+hm <- Heatmap(
+  fgsera_res_pert_mat[as.character(fgsera_res_pert_hm_pathways), fgsea_hm_conditions],
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  left_annotation = HeatmapAnnotation(
+    df = column_to_rownames(row_clust_df, "pathway")[as.character(fgsera_res_pert_hm_pathways), ],
+    which = "row"
+  )
+)
+```
+
+
+## Plotting rescue vector FGSEA results
+
+```{r}
+fgsea_res_rescue_data <- fgsea_res_rescue %>%
+  filter(metric == "signed_padj_rescue_clamped") %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  mutate(
+    sign = if_else(NES > 0, "pos", "neg")
+  )
+
+
+ps <- fgsea_res_rescue_data %>%
+  group_nest(
+    compound
+  ) %>%
+  mutate(
+    p = map2(
+      compound, data,
+      \(x, y) {
+        y %>%
+          filter(
+            padj < .05
+          ) %>%
+          mutate(
+            pathway = fct_reorder(pathway, NES)
+          ) %>%
+          ggplot(
+            aes(
+              x = NES,
+              y = pathway,
+              fill = sign
+            )
+          ) +
+          geom_col() +
+          geom_text(
+            aes(
+              x = if_else(sign == "pos", -.05, .05),
+              hjust = if_else(sign == "pos", 1, 0),
+              label = pathway
+            ),
+            size = 2
+          ) +
+          scale_fill_discrete(guide = "none", direction = -1) +
+          theme(
+            axis.text.y = element_blank(),
+            panel.grid.major.y = element_blank(),
+          ) +
+          labs(
+            x = "Normalized enrichment score",
+            y = NULL,
+            title = paste0("Reactome pathways enriched in genes rescued by ", x),
+            subtitle = "FDR < 0.05"
+          ) + {
+            if (!any(y$sign == "neg"))
+              lims(x = c(-max(abs(y$NES)), NA))
+          }
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(compound, p, ...) {
+    ggsave(
+      file.path("plots", paste0("reactome_", compound, "_bars_rescue.pdf")),
+      p, width = 8, height = 8
+    )
+  }
+)
+```
+
+
+### Comparing rescue vector enrichment PTX vs combo
+
+```{r}
+fgsera_rescue_ptx_vs_combo <- fgsea_res_rescue_data %>%
+  mutate(
+    signed_padj = -sign(NES) * log10(padj)
+  ) %>%
+  filter(
+    database == "REACTOME"
+  ) %>%
+  pivot_wider(
+    names_from = compound,
+    values_from = -c(metric, compound, pathway, database)
+  ) %>%
+  mutate(
+    sig_class = case_when(
+      `padj_GNE-495` < .05 & `padj_JNK-inh` < .05 ~ "both",
+      `padj_GNE-495` < .05 ~ "GNE-495",
+      `padj_JNK-inh` < .05 ~ "JNK-inh",
+      TRUE ~ "none"
+    )
+  )
+
+sig_class_colors <- c(
+  "both" = "purple",
+  "GNE-495" = "red",
+  "JNK-inh" = "blue",
+  "none" = "grey"
+)
+
+p <- fgsera_rescue_ptx_vs_combo %>%
+  arrange(match(sig_class, names(sig_class_colors))) %>%
+  ggplot(
+    aes(
+      x = `signed_padj_GNE-495`,
+      y = `signed_padj_JNK-inh`
+    )
+  ) +
+  geom_point(
+    aes(
+      color = sig_class,
+      text = pathway
+    ),
+    alpha = .8
+  ) +
+  scale_color_manual(
+    values = sig_class_colors
+  ) +
+  labs(
+    x = paste("Enrichment GNE-495 rescue"),
+    y = paste("Enrichment JNK-inh rescue")
+  )
+
+ggsave(
+  file.path("plots", paste0("reactome_rescue_gne_vs_jnk_scatter_padj.pdf")),
+  p, width = 8, height = 8
+)
+htmlwidgets::saveWidget(
+  ggplotly(p),
+  file.path("plots", paste0("reactome_rescue_gne_vs_jnk_scatter_padj.html"))
+)
+
+
+ps <- fgsera_res_ptx_vs_combo %>%
+  group_nest(contrast_ptx, contrast_combo) %>%
+  mutate(
+    p = map2(
+      contrast_combo, data,
+      \(x, y) {
+        ggplot(
+          y %>%
+            arrange(match(sig_class, names(sig_class_colors))),
+          aes(
+            x = NES_ptx,
+            y = NES_combo
+          )
+        ) +
+        geom_point(
+          aes(
+            color = sig_class,
+            text = pathway
+          ),
+          alpha = .8
+        ) +
+        scale_color_manual(
+          values = sig_class_colors
+        )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast_ptx, contrast_combo, p, ...) {
+    ggsave(
+      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter.pdf")),
+      p, width = 8, height = 8
+    )
+    htmlwidgets::saveWidget(
+      ggplotly(p),
+      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter.html"))
+    )
+  }
+)
+```

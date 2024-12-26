@@ -125,7 +125,9 @@ de_all <- DESeq2::DESeqDataSetFromMatrix(
   design = ~ condition
 ) %>%
   DESeq2::estimateSizeFactors()
+```
 
+```{r}
 counts_trans <- list(
   vsn = SummarizedExperiment::assay(DESeq2::varianceStabilizingTransformation(de_all, blind = FALSE)),
   rlog = SummarizedExperiment::assay(DESeq2::rlog(de_all, blind = FALSE)),
@@ -146,6 +148,10 @@ write_csv(
   counts_trans,
   "transformed_counts.csv.gz"
 )
+```
+
+
+```{r}
 counts_trans <- read_csv("transformed_counts.csv.gz")
 
 rlog_mat <- counts_trans %>%
@@ -301,16 +307,6 @@ ggsave(
 )
 ```
 
-
-```{r}
-de_long_selected_wide <- de_long_selected %>%
-  pivot_wider(
-    names_from = contrast,
-    values_from = c(logFC, PValue, FDR, LR, logCPM, FDR_min_zero, signed_padj, perturbed)
-  )
-
-
-```
 
 
 Make alluvial diagram of PTX rescue
@@ -512,8 +508,8 @@ msigdbr_of_interest <- all_msigdbr %>%
     gs_cat == "H" |
     gs_subcat %in% c(
       "CP:PID",
-      "CP:KEGG"
-      # "CP:REACTOME"
+      "CP:KEGG",
+      "CP:REACTOME"
       # "GO:BP",
       # "GO:MF"
     )
@@ -554,7 +550,10 @@ Options
 library(fgsea)
 
 fgsea_rescue_vectors <- ptx_rescue_by_compound %>%
-  filter(perturbed != "not perturbed") %>%
+  filter(
+    perturbed != "not perturbed",
+    gene_id %in% feasible_genes$gene_id
+  ) %>%
   mutate(
     signed_padj_rescue_raw = if_else(
       !xor(signed_padj > 0, `signed_padj + PTX vs PTX` > 0),
@@ -581,7 +580,7 @@ fgsea_rescue_vectors <- ptx_rescue_by_compound %>%
   )
 
 fgsea_rescue_vectors_long <- fgsea_rescue_vectors %>%
-  select(
+  dplyr::select(
     gene_id,
     compound,
     contains("rescue"),
@@ -621,9 +620,65 @@ fgsea_rescue_vectors_res <- fgsea_rescue_vectors_res_raw %>%
   unnest(res)
 
 qsave(
-  fgsea_res,
-  "vemu/fgsea_res.qs"
+  fgsea_rescue_vectors_res,
+  "fgsea_res.qs"
 )
+fgsea_rescue_vectors_res <- qread("fgsea_res.qs")
+```
+
+### FGSEA on raw perturbations
+
+```{r}
+fgsea_pert_input <- de_long_selected %>%
+  filter(
+    gene_id %in% feasible_genes$gene_id
+  ) %>%
+  select(
+    gene_id, contrast, signed_padj, logFC
+  ) %>%
+  pivot_longer(
+    -c(gene_id, contrast),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  group_by(
+    contrast, metric,
+  ) %>%
+  summarize(
+    gene_stats = set_names(
+      value, gene_id
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+fgsea_pert_res_raw <- fgsea_pert_input %>%
+  rowwise() %>%
+  mutate(
+    res = fgseaMultilevel(
+      msigdbr_of_interest_gs,
+      gene_stats,
+      BPPARAM = BiocParallel::MulticoreParam(workers = 6)
+    ) %>%
+      list()
+  ) %>%
+  ungroup()
+
+fgsea_pert_res <- fgsea_pert_res_raw %>%
+  dplyr::select(-gene_stats) %>%
+  unnest(res)
+
+qsave(
+  fgsea_pert_res,
+  "fgsea_pert_res.qs"
+)
+```
+
+
+```{r}
+fgsea_pert_res %>%
+  arrange(padj) %>%
+  View()
 ```
 
 ```{r}
@@ -958,6 +1013,102 @@ go_meta <- topgo_res %>%
 ```
 
 
+### TopGO on raw perturbations
+
+```{r}
+topgo_up_down_funs <- list(
+  up = \(x) x > -log10(.05),
+  down = \(x) x < log10(.05)
+)
+
+topgo_pert_input <- fgsea_pert_input %>%
+  filter(metric == "signed_padj") %>%
+  dplyr::select(-metric) %>%
+  mutate(
+    gene_stats = map(
+      gene_stats,
+      \(x) {
+        set_names(
+          ifelse(feasible_gene_vec %in% names(x), x[feasible_gene_vec], 0),
+          feasible_gene_vec
+        )
+      }
+    )
+  ) %>%
+  crossing(
+    ontology = names(topgo_objects),
+    direction = c("up", "down")
+  )
+
+topgo_res_pert_raw <- topgo_pert_input %>%
+  rowwise() %>%
+  mutate(
+    res = {
+      # browser()
+      go <- updateGenes(
+        topgo_objects[[ontology]],
+        geneList = gene_stats,
+        geneSelFun = topgo_up_down_funs[[direction]]
+      )
+      # browser()
+      raw <- runTest(
+        go,
+        algorithm = "weight01",
+        statistic = "fisher"
+      )
+      res_table <- GenTable(
+        go,
+        fisher = raw,
+        topNodes = length(usedGO(go)),
+        numChar = 300
+      )
+      list(
+        res_raw = raw,
+        res = res_table
+      ) %>%
+        list()
+    }
+  ) %>%
+  ungroup()
+
+qsave(
+  topgo_res_pert_raw,
+  "topgo_res_pert_raw.qs"
+)
+topgo_res_pert_raw <- qread("topgo_res_pert_raw.qs")
+
+topgo_res_pert <- topgo_res_pert_raw %>%
+  rowwise() %>%
+  mutate(
+    res_table = list(res[["res"]])
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-c(res, gene_stats)) %>%
+  unnest(res_table) %>%
+  mutate(
+    term_unique = paste(
+      Term, GO.ID, sep = "_"
+    ),
+    fisher_double = as.double(str_remove(fisher, fixed("< ")))
+  )
+
+qsave(
+  topgo_res_pert,
+  "topgo_res_pert.qs"
+)
+# topgo_res_pert <- qread("topgo_res_pert.qs")
+
+```
+
+### PTX barplot
+
+```{r}
+
+
+```
+
+
+
 ```{r}
 topgo_res_plotting <- topgo_res %>%
   group_by(
@@ -966,23 +1117,25 @@ topgo_res_plotting <- topgo_res %>%
   filter(any(fisher_double < 0.05)) %>%
   ungroup() %>%
   mutate(
-    rescue_type = paste(perturbed, compound, rescue_definition, sep = "_")
+    rescue_type = paste(perturbed, compound, rescue_definition, sep = "_"),
+    odds_ratio = Significant / Expected
   )
 
 topgo_res_plotting_clust <- topgo_res_plotting %>%
-  dplyr::transmute(ontology, term_unique, rescue_type, across(fisher_double, \(x) -log10(x))) %>%
+  dplyr::transmute(ontology, term_unique, rescue_type, odds_ratio, across(fisher_double, \(x) -log10(x))) %>%
   group_nest(ontology) %>%
   mutate(
     data = map(
       data,
-      \(x) cluster_df(x, term_unique, rescue_type, fisher_double)
+      \(x) cluster_df(x, term_unique, rescue_type, odds_ratio)
     )
   ) %>%
   with(set_names(data, ontology))
 
-plot_big_heatmap <- \(x, df) ggplot(
+plot_big_heatmap <- \(x, z, df) ggplot(
   df %>%
     mutate(
+      odds_ratio = if_else(odds_ratio == 0, min(odds_ratio[odds_ratio > 0]) * .5, odds_ratio),
       perturbed = factor(perturbed, levels = c("up", "down")),
       compound = factor(compound, levels = c("PTX", "JNK-inh", "GNE-495")),
       rescue_definition = factor(rescue_definition, levels = c("return_baseline", "significant_opposite", "overshot")),
@@ -997,18 +1150,35 @@ plot_big_heatmap <- \(x, df) ggplot(
   aes(
     x = rescue_type,
     y = term_unique,
-    fill = fisher_double
+    fill = {{z}}
   )
 ) +
   geom_raster() +
   ggplot2::scale_fill_gradientn(
-    colours = rev(c("#2166ac", "#d1e5f0", "#fddbc7", "#b2182b")),
-    limits = c(quantile(topgo_res_plotting$fisher_double, .01), 1),
-    values = scales::rescale(log10(c(quantile(topgo_res_plotting$fisher_double, .01), 0.04999, 0.05, 1))),
+    colours = c("#2166ac", "white", "#b2182b"),
+    # limits = c(quantile(pull(topgo_res_plotting, {{z}}), .01), 1),
+    limits = {
+      # browser()
+      abs_max <- max(abs(quantile(pull(topgo_res_plotting, {{z}}), c(.01, .99))))
+      # scales::rescale(c(-abs_max, 0, abs_max))
+      c(1/abs_max, abs_max)
+    },
+    values = {
+      abs_max <- max(abs(quantile(pull(topgo_res_plotting, {{z}}), c(.01, .99))))
+      scales::rescale(log10(c(1/abs_max, 1, abs_max)))
+    },
     oob = scales::squish,
     # labels = c("p > 0.05", "p = 0.05", "p <= 0.05"),
     trans = "log10"
   ) +
+  # ggplot2::scale_fill_gradientn(
+  #   colours = rev(c("#2166ac", "#d1e5f0", "#fddbc7", "#b2182b")),
+  #   limits = c(quantile(topgo_res_plotting$fisher_double, .01), 1),
+  #   values = scales::rescale(log10(c(quantile(topgo_res_plotting$fisher_double, .01), 0.04999, 0.05, 1))),
+  #   oob = scales::squish,
+  #   # labels = c("p > 0.05", "p = 0.05", "p <= 0.05"),
+  #   trans = "log10"
+  # ) +
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
   )
@@ -1017,14 +1187,14 @@ plot_big_heatmap <- \(x, df) ggplot(
 ps <- map(
   names(topgo_res_plotting_clust) %>%
     set_names(),
-  \(x, y) plot_big_heatmap(x, topgo_res_plotting)
+  \(x, y) plot_big_heatmap(x, odds_ratio, topgo_res_plotting)
 )
 
 iwalk(
   ps,
   \(p, name) {
     ggsave(
-      file.path("plots", paste0("topgo_big_heatmap_", name, "2.pdf")),
+      file.path("plots", paste0("topgo_big_heatmap_", name, "_or.pdf")),
       p, width = 12, height = 30
     )
   }
@@ -1055,7 +1225,7 @@ topgo_res_plotting_picks <- topgo_res_plotting %>%
 ps <- map(
   names(topgo_res_plotting_clust) %>%
     set_names(),
-  \(x, y) plot_big_heatmap(x, topgo_res_plotting_picks)
+  \(x, y) plot_big_heatmap(x, odds_ratio, topgo_res_plotting_picks)
 )
 
 iwalk(
@@ -1523,6 +1693,11 @@ gprofiler_res <- gprofiler_res_raw$result %>%
       duplicate_keys_right = "warn"
     )
   )
+
+write_csv(
+  gprofiler_res,
+  "gprofiler_res.csv.gz"
+)
 ```
 
 
@@ -2318,3 +2493,28 @@ ggsave(
   p, width = 8, height = 4, device = cairo_pdf
 )
 ```
+
+## Save to synapse
+
+```{r}
+cipn_syn <- "syn63837896"
+analysis_syn <- synMkdir(cipn_syn, "analysis")
+
+synStoreMany(
+  c(
+    "fgsea_res.qs",
+    "fgsea_pert_res.qs",
+    "topgo_res.qs",
+    "topgo_res_raw.qs",
+    "topgo_res_pert_raw.qs",
+    "topgo_res_pert.qs",
+    "gprofiler_res_raw.qs",
+    "gprofiler_res.csv.gz",
+    "chea3_res_raw.qs",
+    "chea3_res.csv.gz"
+  ),
+  parentId = analysis_syn,
+  forceVersion = FALSE
+)
+```
+
