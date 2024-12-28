@@ -7,6 +7,7 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
+library(here)
 library(tidyverse)
 library(data.table)
 library(synExtra)
@@ -22,7 +23,7 @@ syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
 ## Reading GSE results
 
 ```{r}
-top_go_res_pert <- syn("syn64461453") %>%
+topgo_res_pert <- syn("syn64461453") %>%
   qread()
 
 fgsera_res_pert <- syn("syn64461445") %>%
@@ -116,6 +117,23 @@ pwalk(
 ### Comparison with combination treatment
 
 ```{r}
+all_contrasts <- fgsera_res_pert$contrast %>%
+  unique()
+
+contrast_plotting_pairs <- bind_rows(
+  tibble(
+    contrast_1 = "PTX",
+    contrast_2 = all_contrasts[
+      str_ends(all_contrasts, fixed("+ PTX")) |
+      str_ends(all_contrasts, fixed("+ PTX vs PTX"))
+    ]
+  ),
+  tibble(
+    contrast_1 = "GNE-495 + PTX",
+    contrast_2 = "JNK-inh + PTX"
+  )
+)
+
 fgsera_res_ptx_vs_combo <- fgsera_res_pert %>%
   filter(
     metric == "signed_padj"
@@ -132,49 +150,53 @@ fgsera_res_ptx_vs_combo <- fgsera_res_pert %>%
   filter(
     database == "REACTOME"
   ) %>% {
+    d <- .
     power_inner_join(
-      filter(., contrast == "PTX"),
-      filter(
-        .,
-        str_ends(contrast, fixed("+ PTX"))
-      ),
-      by = join_by(metric, database, pathway),
-      suffix = c("_ptx", "_combo"),
+      contrast_plotting_pairs,
+      d,
+      by = join_by(contrast_1 == contrast),
+      suffix = c("", "_1"),
       check = check_specs(
-        duplicate_keys_left = "warn",
-        unmatched_keys_left = "warn",
-        unmatched_keys_right = "warn"
+        unmatched_keys_left = "warn"
+      )
+    ) %>%
+    power_inner_join(
+      d,
+      by = join_by(contrast_2 == contrast, metric, database, pathway),
+      suffix = c("_1", "_2"),
+      check = check_specs(
+        unmatched_keys_left = "warn"
       )
     )
   } %>%
   mutate(
     sig_class = case_when(
-      padj_ptx < .05 & padj_combo < .05 ~ "both",
-      padj_ptx < .05 ~ "ptx",
-      padj_combo < .05 ~ "combo",
+      padj_1 < .05 & padj_2 < .05 ~ "both",
+      padj_1 < .05 ~ "1",
+      padj_2 < .05 ~ "2",
       TRUE ~ "none"
     )
   )
 
 sig_class_colors <- c(
   "both" = "purple",
-  "ptx" = "red",
-  "combo" = "blue",
+  "1" = "red",
+  "2" = "blue",
   "none" = "grey"
 )
 
 ps <- fgsera_res_ptx_vs_combo %>%
-  group_nest(contrast_ptx, contrast_combo) %>%
+  group_nest(contrast_1, contrast_2) %>%
   mutate(
-    p = map2(
-      contrast_combo, data,
-      \(x, y) {
+    p = pmap(
+      .,
+      \(contrast_1, contrast_2, data, ...) {
         ggplot(
-          y %>%
+          data %>%
             arrange(match(sig_class, names(sig_class_colors))),
           aes(
-            x = signed_padj_ptx,
-            y = signed_padj_combo
+            x = signed_padj_1,
+            y = signed_padj_2
           )
         ) +
         geom_point(
@@ -185,11 +207,20 @@ ps <- fgsera_res_ptx_vs_combo %>%
           alpha = .8
         ) +
         scale_color_manual(
-          values = sig_class_colors
+          name = "Significant\nenrichment\nFDR < 0.05",
+          values = sig_class_colors,
+          breaks = names(sig_class_colors),
+          labels = c(
+            "Both",
+            contrast_1,
+            contrast_2,
+            "None"
+          )
         ) +
+        theme_minimal() +
         labs(
-          x = paste("Enrichment PTX"),
-          y = paste("Enrichment", x)
+          x = paste("Enrichment", contrast_1),
+          y = paste("Enrichment", contrast_2)
         )
       }
     )
@@ -197,14 +228,14 @@ ps <- fgsera_res_ptx_vs_combo %>%
 
 pwalk(
   ps,
-  \(contrast_ptx, contrast_combo, p, ...) {
+  \(contrast_1, contrast_2, p, ...) {
     ggsave(
-      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter_padj.pdf")),
+      file.path("plots", paste0("reactome_", contrast_1, "_vs_", contrast_2, "_scatter_padj.pdf")),
       p, width = 8, height = 8
     )
     htmlwidgets::saveWidget(
       ggplotly(p),
-      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter_padj.html"))
+      file.path("plots", paste0("reactome_", contrast_1, "_vs_", contrast_2, "_scatter_padj.html"))
     )
   }
 )
@@ -441,7 +472,7 @@ fgsera_res_pert_mat <- fgsera_res_pert_hm_data %>%
 
 fgsera_res_pert_hm_pathways <- fgsera_res_pert_hm_data %>%
   filter(
-    padj < 0.05
+    padj < 0.01
   ) %>%
   pull(pathway) %>%
   unique()
@@ -470,7 +501,18 @@ row_clust_df <- row_clust_df_long %>%
   )
 ```
 
-k = 7 seems to work well
+k = 8 seems to work well
+
+
+```{r}
+dir.create(here("results"), showWarnings = FALSE)
+write_csv(
+  row_clust_df_long %>%
+    filter(k == 8),
+  here("results", "reactome_pert_clusters_k8.csv")
+)
+
+```
 
 ```{r}
 library(ComplexHeatmap)
@@ -484,6 +526,62 @@ hm <- Heatmap(
     which = "row"
   )
 )
+
+mat <- fgsera_res_pert_mat[as.character(fgsera_res_pert_hm_pathways), fgsea_hm_conditions]
+mat_max_abs <- max(abs(quantile(mat, c(.025, .975), na.rm = TRUE)))
+hm <- Heatmap(
+  mat,
+  col = circlize::colorRamp2(seq(from = -mat_max_abs, to = mat_max_abs, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
+  name = "Normalized enrichment score",
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  left_annotation = HeatmapAnnotation(
+    df = row_clust_df %>%
+        select(pathway, cluster = k_8) %>%
+        slice(match(as.character(fgsera_res_pert_hm_pathways), pathway)) %>%
+        column_to_rownames("pathway"),
+    col = list(
+      cluster = set_names(
+        ggokabeito::palette_okabe_ito(1:8), 1:8
+      )
+    ),
+    which = "row"
+  ),
+  right_annotation = HeatmapAnnotation(
+    pathways = c(
+      "ACTIVATION_OF_GENE_EXPRESSION_BY_SREBF_SREBP",
+      "FATTY_ACID_METABOLISM",
+      "METABOLISM_OF_LIPIDS",
+      "TRNA_AMINOACYLATION",
+      "CELL_CYCLE",
+      "REGULATION_OF_EXPRESSION_OF_SLITS_AND_ROBOS",
+      "GAP_JUNCTION_TRAFFICKING_AND_REGULATION",
+      "ER_TO_GOLGI_ANTEROGRADE_TRANSPORT",
+      "COPI_MEDIATED_ANTEROGRADE_TRANSPORT"
+    ) %>%
+      {
+        anno_mark(
+          at = match(., fgsera_res_pert_hm_pathways),
+          labels = str_wrap(
+            str_replace_all(., "_", " "),
+            20
+          ),
+          labels_gp = gpar(fontsize = 6),
+          padding = unit(2, "mm")
+        )
+      },
+    which = "row"
+  )
+)
+
+withr::with_pdf(
+  here("plots", "reactome_pert_heatmap_k8.pdf"),
+  draw(hm),
+  width = 6, height = 8
+)
+
+InteractiveComplexHeatmap::htShiny(hm, save = here("plots/reactome_pert_heatmap_k8"))
 ```
 
 
@@ -669,3 +767,166 @@ pwalk(
   }
 )
 ```
+
+
+## TopGO
+
+check if sometimes the same pathway is enriched in both up and downregulated genes
+
+```{r}
+topgo_res_pert %>%
+  pivot_wider(
+    names_from = direction,
+    values_from = -c(contrast, direction, ontology, GO.ID, Term, term_unique, Annotated)
+  ) %>%
+  filter(
+    fisher_double_down < .05,
+    fisher_double_up < .05
+  ) %>%
+  View()
+```
+
+Make directed topgo results object by taking the log10 p-value
+and the sign corresponds to the direction of the enrichment
+
+If the same pathway is enriched in both directions, the pathway
+occurs twice with different signs
+
+```{r}
+topgo_res_pert_directed <- topgo_res_pert %>%
+  mutate(
+    log_odds_ratio = {Significant / Expected} %>%
+      if_else(
+        !is.finite(.) | . == 0,
+        sign(.) * min(.[. > 0]) * .5,
+        .
+      ) %>%
+      log10()
+  ) %>%
+  group_by(
+    contrast, ontology, GO.ID, Term, term_unique, Annotated
+  ) %>%
+  slice(
+    if (sum(fisher_double < .05) < 2) {
+      order(fisher_double)[1]
+    } else {
+      order(fisher_double)
+    }
+  ) %>%
+  mutate(
+    picked_direction = if (n() < 2) direction else "both",
+    signed_padj = -sign(log_odds_ratio) * log10(fisher_double)
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r}
+all_contrasts <- topgo_res_pert_directed$contrast %>%
+  unique()
+
+contrast_plotting_pairs <- bind_rows(
+  tibble(
+    contrast_1 = "PTX",
+    contrast_2 = all_contrasts[
+      str_ends(all_contrasts, fixed("+ PTX")) |
+      str_ends(all_contrasts, fixed("+ PTX vs PTX"))
+    ]
+  ),
+  tibble(
+    contrast_1 = "GNE-495 + PTX",
+    contrast_2 = "JNK-inh + PTX"
+  )
+)
+```
+
+```{r}
+topgo_res_ptx_vs_combo <- topgo_res_pert_directed %>%
+  filter(
+    ontology == "BP"
+  ) %>% {
+    d <- .
+    power_inner_join(
+      contrast_plotting_pairs,
+      d,
+      by = join_by(contrast_1 == contrast),
+      suffix = c("", "_1"),
+      check = check_specs(
+        unmatched_keys_left = "warn"
+      )
+    ) %>%
+    power_inner_join(
+      d,
+      by = join_by(contrast_2 == contrast, ontology, GO.ID, Term, term_unique, Annotated),
+      suffix = c("_1", "_2"),
+      check = check_specs(
+        unmatched_keys_left = "warn"
+      )
+    )
+  } %>%
+  mutate(
+    sig_class = case_when(
+      fisher_double_1 < .05 & fisher_double_2 < .05 ~ "both",
+      fisher_double_1 < .05 ~ "1",
+      fisher_double_2 < .05 ~ "2",
+      TRUE ~ "none"
+    )
+  )
+
+sig_class_colors <- c(
+  "both" = "purple",
+  "1" = "red",
+  "2" = "blue",
+  "none" = "grey"
+)
+
+ps <- topgo_res_ptx_vs_combo %>%
+  group_nest(contrast_1, contrast_2) %>%
+  mutate(
+    p = pmap(
+      .,
+      \(contrast_1, contrast_2, data, ...) {
+        ggplot(
+          data %>%
+            arrange(match(sig_class, names(sig_class_colors))),
+          aes(
+            x = signed_padj_1,
+            y = signed_padj_2
+          )
+        ) +
+        geom_point(
+          aes(
+            color = sig_class,
+            text = Term
+          ),
+          alpha = .8
+        ) +
+        scale_color_manual(
+          values = sig_class_colors
+        ) +
+        labs(
+          x = paste("Enrichment", contrast_1),
+          y = paste("Enrichment", contrast_2)
+        )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast_1, contrast_2, p, ...) {
+    ggsave(
+      file.path("plots", paste0("topgo_", contrast_1, "_vs_", contrast_2, "_scatter_padj.pdf")),
+      p, width = 8, height = 8
+    )
+    htmlwidgets::saveWidget(
+      ggplotly(p),
+      file.path("plots", paste0("topgo_", contrast_1, "_vs_", contrast_2, "_scatter_padj.html"))
+    )
+  }
+)
+
+
+```
+
