@@ -183,6 +183,74 @@ rlog_scaled2 <- {
 
 ```
 
+## Volcano plot
+
+```{r}
+ps <- de_long_selected %>%
+  group_nest(contrast) %>%
+  mutate(
+    p = pmap(
+      .,
+      \(contrast, data, ...) {
+        ggplot(
+          data %>%
+            arrange(
+              match(perturbed, c("not perturbed", "down", "up"))
+            ),
+          aes(
+            x = logFC,
+            y = -log10(FDR)
+          )
+        ) +
+          geom_point(
+            aes(color = perturbed),
+            alpha = .5
+          ) +
+          geom_vline(
+            xintercept = 0,
+            color = "gray",
+            linetype = "dashed"
+          ) +
+          geom_hline(
+            yintercept = -log10(.05),
+            color = "gray",
+            linetype = "dashed"
+          ) +
+          scale_color_manual(
+            values = c("not perturbed" = "gray", "up" = "#630D22", "down" = "#212A62")
+          ) +
+          geom_text(
+            aes(
+              x = if_else(perturbed == "down", -Inf, Inf),
+              hjust = if_else(perturbed == "down", 0, 1),
+              label = paste(n, perturbed)
+            ),
+            data = \(x) dplyr::count(x, perturbed) %>%
+              filter(perturbed != "not perturbed"),
+            y = Inf,
+            vjust = 1,
+            inherit.aes = FALSE
+          ) +
+          labs(
+            x = "log2 fold-change",
+            y = "-log10(adjusted p-value)",
+            title = paste(contrast, "vs DMSO")
+          )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(contrast, p, ...) {
+    ggsave(
+      file.path("plots", paste0("volcano_", contrast, ".pdf")),
+      p, width = 6, height = 4
+    )
+  }
+)
+```
+
 
 PTX rescue
 
