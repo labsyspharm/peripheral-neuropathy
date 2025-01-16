@@ -78,6 +78,11 @@ de_long_selected <- de_long %>%
       TRUE ~ NA_character_
     )
   )
+
+write_csv(
+  de_long_selected,
+  "de_long_selected.csv.gz"
+)
 ```
 
 
@@ -108,6 +113,11 @@ feasible_genes <- raw_counts_long %>%
     feasible = sum(value > 5) > 3,
     .groups = "drop"
   )
+
+write_csv(
+  feasible_genes,
+  "feasible_genes.csv.gz"
+)
 ```
 
 ```{r}
@@ -624,12 +634,12 @@ fgsea_rescue_vectors <- ptx_rescue_by_compound %>%
   ) %>%
   mutate(
     signed_padj_rescue_raw = if_else(
-      !xor(signed_padj > 0, `signed_padj + PTX vs PTX` > 0),
+      sign(signed_padj) == sign(`signed_padj + PTX vs PTX`),
       0,
       `signed_padj + PTX vs PTX`
     ),
     logFC_rescue_raw = if_else(
-      !xor(logFC > 0, `logFC + PTX vs PTX` > 0),
+      sign(logFC) == sign(`logFC + PTX vs PTX`),
       0,
       `logFC + PTX vs PTX`
     ),
@@ -659,8 +669,26 @@ fgsea_rescue_vectors_long <- fgsea_rescue_vectors %>%
     names_to = "metric",
     values_to = "value"
   )
+```
 
+### Check rescue vectors
 
+```{r}
+p <- fgsea_rescue_vectors %>%
+  filter(
+    compound == "GNE-495"
+  ) %>%
+  ggplot(
+    aes(
+      x = signed_padj,
+      y = signed_padj_rescue_clamped
+    )
+  ) +
+  geom_point()
+p
+```
+
+```{r}
 fgsea_rescue_vectors_grouped <- fgsea_rescue_vectors_long %>%
   group_by(metric, compound) %>%
   summarize(
@@ -692,6 +720,23 @@ qsave(
   "fgsea_res.qs"
 )
 fgsea_rescue_vectors_res <- qread("fgsea_res.qs")
+```
+
+
+```{r}
+plotEnrichment(
+  msigdbr_of_interest_gs[["REACTOME_RECYCLING_PATHWAY_OF_L1"]],
+  fgsea_rescue_vectors_grouped %>%
+    filter(compound == "GNE-495", metric == "signed_padj_rescue_clamped") %>%
+    chuck("gene_stats", 1)
+)
+
+plotEnrichment(
+  msigdbr_of_interest_gs[["REACTOME_RECYCLING_PATHWAY_OF_L1"]],
+  fgsea_rescue_vectors_grouped %>%
+    filter(compound == "JNK-inh", metric == "signed_padj_rescue_clamped") %>%
+    chuck("gene_stats", 1)
+)
 ```
 
 ### FGSEA on raw perturbations
@@ -1167,6 +1212,256 @@ qsave(
 # topgo_res_pert <- qread("topgo_res_pert.qs")
 
 ```
+
+## FGSEA overrepresentation
+
+### FGSEA overrepresentation on rescue gene sets
+
+```{r}
+ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
+  mutate(
+    res = map(
+      gene_vec,
+      \(x) {
+        gs <- intersect(names(x)[x < .05], feasible_gene_vec)
+        fora(
+          msigdbr_of_interest_gs,
+          gs,
+          universe = feasible_gene_vec
+        )
+      }
+    ),
+    res_fisher = map(
+      gene_vec,
+      \(x) {
+        gs <- intersect(names(x)[x < .05], feasible_gene_vec)
+        map(
+          msigdbr_of_interest_gs,
+          possibly(\(y) {
+            fisher.test(
+              feasible_gene_vec %in% gs,
+              feasible_gene_vec %in% y,
+              alternative = "greater"
+            ) %>%
+              broom::tidy()
+          })
+        ) %>%
+          bind_rows(.id = "pathway")
+      }
+    )
+  )
+
+
+ptx_rescue_overrepresentation <- ptx_rescue_overrepresentation_raw %>%
+  transmute(
+    rescue_definition, perturbed, compound,
+    res = map2(
+      res, res_fisher,
+      \(x, y) power_full_join(
+        dplyr::rename(x, p.value = pval),
+        mutate(y, padj = p.adjust(p.value, method = "BH")),
+        by = "pathway",
+        suffix = c("_fgsea", "_fisher"),
+        check = check_specs(
+          duplicate_keys_left = "warn",
+          duplicate_keys_right = "warn"
+        )
+      ) %>%
+        as_tibble()
+    )
+  ) %>%
+  unnest(res)
+
+qsave(
+  ptx_rescue_overrepresentation,
+  "ptx_rescue_overrepresentation.qs"
+)
+```
+
+### FGSEA overrepresentation on rescue gene set intersections
+
+Rescued by both, neither, or single drugs
+
+```{r}
+ptx_rescue_intersections <- ptx_rescue_type_list %>%
+  filter(perturbed != "not perturbed") %>%
+  group_nest(rescue_definition, perturbed, rescue_type) %>%
+  bind_rows(
+    ptx_rescue_type_list %>%
+      filter(perturbed != "not perturbed") %>%
+      group_nest(rescue_definition, rescue_type) %>%
+      mutate(
+        perturbed = "both_up_down"
+      )
+  )
+
+ptx_rescue_intersections_overrepresentation_raw <- ptx_rescue_intersections %>%
+  mutate(
+    res = map(
+      data,
+      \(x) {
+        gs <- intersect(feasible_gene_vec, x$gene_id)
+        fora(
+          msigdbr_of_interest_gs,
+          gs,
+          universe = feasible_gene_vec
+        )
+      }
+    ),
+    res_fisher = map(
+      data,
+      \(x) {
+        gs <- intersect(feasible_gene_vec, x$gene_id)
+        map(
+          msigdbr_of_interest_gs,
+          possibly(\(y) {
+            fisher.test(
+              feasible_gene_vec %in% gs,
+              feasible_gene_vec %in% y,
+              alternative = "greater"
+            ) %>%
+              broom::tidy()
+          })
+        ) %>%
+          bind_rows(.id = "pathway")
+      }
+    )
+  )
+
+
+ptx_rescue_intersections_overrepresentation <- ptx_rescue_intersections_overrepresentation_raw %>%
+  transmute(
+    rescue_definition, perturbed, rescue_type,
+    res = map2(
+      res, res_fisher,
+      \(x, y) power_full_join(
+        dplyr::rename(x, p.value = pval),
+        mutate(y, padj = p.adjust(p.value, method = "BH")),
+        by = "pathway",
+        suffix = c("_fgsea", "_fisher"),
+        check = check_specs(
+          duplicate_keys_left = "warn",
+          duplicate_keys_right = "warn"
+        )
+      ) %>%
+        as_tibble()
+    )
+  ) %>%
+  unnest(res)
+
+qsave(
+  ptx_rescue_intersections_overrepresentation,
+  "ptx_rescue_intersections_overrepresentation.qs"
+)
+
+
+```
+
+```{r}
+ptx_rescue_intersections_overrepresentation %>%
+  filter(rescue_definition == "significant_opposite") %>%
+  filter(rescue_type == "GNE-495 only") %>%
+  arrange(p.value_fisher) %>%
+  View()
+
+```
+
+### FGSEA overrepresentation on raw perturbations
+
+
+```{r}
+ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
+  mutate(
+    res = map(
+      gene_vec,
+      \(x) {
+        gs <- names(x)[x < .05]
+        fora(
+          msigdbr_of_interest_gs,
+          gs,
+          universe = feasible_gene_vec
+        )
+      }
+    )
+  )
+
+
+ptx_rescue_overrepresentation <- ptx_rescue_overrepresentation_raw %>%
+  select(-gene_vec) %>%
+  unnest(res)
+
+qsave(
+  ptx_rescue_overrepresentation,
+  "ptx_rescue_overrepresentation.qs"
+)
+
+```
+
+
+
+## Clue queries
+
+### Clue queries on rescue gene sets
+
+Requiring padj < .05, using 150 most significant genes for the query
+
+```{r}
+library(cluequery)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+entrez_gene_mapping <- select(
+  org.Hs.eg.db,
+  keys = unique(de_long_selected$gene_id),
+  columns = c("ENSEMBL", "ENTREZID"),
+  keytype = "ENSEMBL"
+) %>%
+  drop_na(ENTREZID) %>%
+  distinct() %>%
+  as_tibble()
+
+clue_input_data <- de_long_selected %>%
+  filter(
+    FDR < .05
+  ) %>%
+  power_inner_join(
+    entrez_gene_mapping,
+    by = c("gene_id" = "ENSEMBL"),
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  ) %>%
+  filter(
+    ENTREZID %in% cluequery::gene_space[["entrez_id"]][cluequery::gene_space[["bing"]]]
+  ) %>%
+  arrange(PValue) %>%
+  group_by(contrast, perturbed) %>%
+  slice_head(n = 150) %>%
+  ungroup() %>%
+  dplyr::select(
+    gene_id = ENTREZID,
+    gene_set = contrast,
+    direction = perturbed
+  )
+
+clue_input_data %>%
+  count(
+    gene_set, direction
+  )
+
+clue_input_gmt <- clue_gmt_from_df(
+  clue_input_data,
+  drop_invalid = TRUE
+)
+
+clue_job <- clue_query_submit(
+  clue_input_gmt[["up"]], clue_input_gmt[["down"]],
+  "PTX rescue conditions BING"
+)
+clue_query_wait(clue_job)
+```
+
 
 ### PTX barplot
 
@@ -2151,74 +2446,97 @@ ggsave(
 ```
 
 
+GNE-495 alone
+
+## Alluvial diagram of rescued genes by definition
+
 ```{r}
-pax_rescue_list %>%
-  count(`PTX perturbed`)
+library(ggalluvial)
 
-pax_rescue_alluvials_simple <- pax_rescue_list %>%
-  count(
-    `PTX perturbed`,
-    `GNE-495 + PTX rescue`,
-    `JNK-inh + PTX rescue`
-  )
+ptx_rescue_type_list %>%
+  count(perturbed)
 
-pax_rescue_alluvials <- pax_rescue_list %>%
-  count(
-    `PTX perturbed`,
-    `GNE-495 + PTX perturbed`,
-    `JNK-inh + PTX perturbed`,
-    `GNE-495 + PTX rescue`,
-    `JNK-inh + PTX rescue`
-  )
-
-pax_rescue_lodes <- pax_rescue_list_simple %>%
-  count(
-    `PTX perturbed`,
-    `GNE-495 + PTX rescue`,
-    `JNK-inh + PTX rescue`
-  )
-  to_lodes_form(
-    c(`PTX perturbed`, `GNE-495 + PTX rescue`, `JNK-inh + PTX rescue`),
-    key = "Contrast", value = "Gene set"
-  )
-
-p <- ggplot(
-  ,
-  aes(
-    x = Contrast, y = n, stratum = `Gene set`, alluvium = alluvium
-  )
-) +
-  scale_x_discrete(expand = c(0.05, 0.05)) +
-  geom_alluvium(
-    aes(
-      # color = `PTX perturbed 2`,
-      fill = `Rescue type`
+ptx_rescue_alluvial_plots <- ptx_rescue_type_list %>%
+  group_nest(rescue_definition) %>%
+  mutate(
+    alluvial_data = map(
+      data,
+      \(x) count(
+        x,
+        `PTX perturbed` = perturbed,
+        `GNE-495 perturbed` = `GNE-495`,
+        `JNK-inh perturbed` = `JNK-inh`,
+        rescue_type
+      ) %>%
+        filter(`PTX perturbed` != "not perturbed")
     ),
-    width = 1/10
-  ) +
-  # ggokabeito::scale_color_okabe_ito(order = c(2, 1), guide = "none") +
-  scale_fill_manual(
-    values = c(
-      both = "black",
-      `JNK-inh only rescue` = "purple",
-      `GNE-495 only rescue` = "green",
-      `no rescue` = "gray85"
+    lode_data = map(
+      alluvial_data,
+      \(x) to_lodes_form(
+        x,
+        ends_with("perturbed"),
+        key = "Contrast", value = "Gene set"
+      )
+    ),
+    p = map(
+      lode_data,
+      \(x)
+      ggplot(
+        x,
+        aes(
+          x = Contrast, y = n, stratum = `Gene set`, alluvium = alluvium
+        )
+      ) +
+        scale_x_discrete(expand = c(0.05, 0.05)) +
+        geom_alluvium(
+          aes(
+            # color = `PTX perturbed 2`,
+            fill = rescue_type
+          ),
+          width = 1/10
+        ) +
+        # ggokabeito::scale_color_okabe_ito(order = c(2, 1), guide = "none") +
+        scale_fill_manual(
+          values = c(
+            both = "black",
+            `JNK-inh only` = "purple",
+            `GNE-495 only` = "green",
+            `no rescue` = "gray85"
+          )
+        ) +
+        labs(x = NULL) +
+        # scale_fill_manual(
+        #     values = c(existing = "#a2a2a2", added = "#c81919"),
+        #     guide = "none"
+        # ) +
+        geom_stratum(width = 1/6) +
+        # geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+        geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+        geom_text(
+          aes(
+            x = stage(Contrast, after_scale = x + .12),
+            label = n
+          ),
+          stat = StatAlluvium,
+          hjust = 0,
+          data = \(x) filter(x, as.integer(Contrast) == 1L)
+        ) +
+        theme_minimal() +
+        # labs(y = "Data points", fill = NA) +
+        theme(
+            panel.grid.major.x = element_blank()
+        ) +
+        coord_cartesian(clip = "off")
     )
-  ) +
-  labs(x = NULL) +
-  # scale_fill_manual(
-  #     values = c(existing = "#a2a2a2", added = "#c81919"),
-  #     guide = "none"
-  # ) +
-  geom_stratum(width = 1/6) +
-  # geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
-  geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
-  theme_minimal() +
-  # labs(y = "Data points", fill = NA) +
-  theme(
-      panel.grid.major.x = element_blank()
-  ) +
-  coord_cartesian(clip = "off")
+  )
+
+pwalk(
+  ptx_rescue_alluvial_plots,
+  \(p, rescue_definition, ...) ggsave(
+    file.path("plots", paste0("ptx_rescue_", rescue_definition, "_alluvium.pdf")),
+    p, width = 6, height = 4
+  )
+)
 
 ggsave(
   file.path("plots", "ptx_rescue_no_threshold_alluvium.pdf"),
@@ -2562,6 +2880,13 @@ ggsave(
 )
 ```
 
+## Excel table
+
+```{r}
+
+
+```
+
 ## Save to synapse
 
 ```{r}
@@ -2579,10 +2904,22 @@ synStoreMany(
     "gprofiler_res_raw.qs",
     "gprofiler_res.csv.gz",
     "chea3_res_raw.qs",
-    "chea3_res.csv.gz"
+    "chea3_res.csv.gz",
+    "transformed_counts.csv.gz",
+    "de_long_selected.csv.gz",
+    "feasible_genes.csv.gz",
+    "ptx_rescue_overrepresentation.qs",
+    "ptx_rescue_intersections_overrepresentation.qs"
   ),
   parentId = analysis_syn,
   forceVersion = FALSE
 )
 ```
 
+
+* Make sure that heatmap with fgsea terms includes *all* not just PTX perturbed
+* Look at gene set interactions GNE rescue JNK rescue PTx perturbations
+* Excel sheet of all the rescues!
+* Update alluvial
+* Interactive heatmap
+* Massive heatmap with all genes
