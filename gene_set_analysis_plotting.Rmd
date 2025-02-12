@@ -43,6 +43,21 @@ fgsea_overrep <- syn("syn64582959") %>%
 
 fgsea_intersection_overrep <- syn("syn64586672") %>%
   qread()
+
+rag_ion_channel_genes <- syn("syn64745787") %>%
+  readxl::read_excel() %>%
+  pivot_longer(
+    everything(),
+    names_to = "gene_set",
+    values_to = "gene_symbol_mouse"
+  ) %>%
+  drop_na()
+
+ptx_rescue_list <- syn("syn64608137") %>%
+  read_csv()
+
+ptx_rescue_types <- syn("syn64608138") %>%
+  read_csv()
 ```
 
 
@@ -1320,7 +1335,7 @@ de_pert_rescue_hm_data <- tibble(
         filter(
           gene_id %in% x
         ) %>%
-        select(gene_id, contrast, logFC) %>%
+        select(gene_id, con trast, logFC) %>%
         pivot_wider(names_from = contrast, values_from = logFC, values_fill = 0) %>%
         column_to_rownames("gene_id") %>%
         as.matrix() %>% {
@@ -1545,4 +1560,380 @@ pwalk(
 
 
 ```
+
+## Create Excel table
+
+1. Differential expression
+2. FGSEA on raw perturbations
+3. FGSEA on rescue vectors
+4. Overrepresentation on rescue gene sets
+5. Overrepresentation on rescue gene set intersections
+
+```{r}
+gene_id_symbol_map <- de_long_selected %>%
+  distinct(gene_id, gene_name)
+
+gene_id_symbol_vec <- with(
+  gene_id_symbol_map,
+  set_names(gene_name, gene_id)
+)
+
+excel_de <- de_long_selected %>%
+  select(-FDR_min_zero)
+
+excel_fgsea_raw <- fgsea_res_pert %>%
+  filter(metric == "signed_padj") %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  select(-c(metric, log2err, ES)) %>%
+  mutate(
+    contrast = if_else(str_ends(contrast, fixed("vs PTX")), contrast, paste(contrast, "vs DMSO")),
+    leadingEdge = map_chr(
+      leadingEdge,
+      \(x) str_flatten(gene_id_symbol_vec[x], collapse = ",")
+    )
+  )
+
+excel_fgsea_rescue <- fgsea_res_rescue %>%
+  filter(metric == "signed_padj_rescue_clamped") %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  select(-c(metric, log2err, ES)) %>%
+  mutate(
+    leadingEdge = map_chr(
+      leadingEdge,
+      \(x) str_flatten(gene_id_symbol_vec[x], collapse = ",")
+    )
+  )
+
+excel_overrep_rescue <- fgsea_overrep %>%
+  filter(rescue_definition == "significant_opposite") %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  transmute(
+    compound, ptx_direction = perturbed,
+    database, pathway,
+    pval = p.value_fisher, padj = padj_fisher,
+    odds_ratio = estimate,
+    size, overlap,
+    leadingEdge = map_chr(
+      overlapGenes,
+      \(x) str_flatten(gene_id_symbol_vec[x], collapse = ",")
+    )
+  )
+
+excel_overrep_intersections <- fgsea_intersection_overrep %>%
+  filter(rescue_definition == "significant_opposite") %>%
+  separate_wider_delim(
+    pathway,
+    delim = "_",
+    names = c("database", "pathway"),
+    too_many = "merge"
+  ) %>%
+  transmute(
+    rescue_type, ptx_direction = perturbed,
+    database, pathway,
+    pval = p.value_fisher, padj = padj_fisher,
+    odds_ratio = estimate,
+    size, overlap,
+    leadingEdge = map_chr(
+      overlapGenes,
+      \(x) str_flatten(gene_id_symbol_vec[x], collapse = ",")
+    )
+  )
+```
+
+```{r}
+library(openxlsx)
+
+openxlsx::write.xlsx(
+  list(
+    "Differential expression" = excel_de,
+    "FGSEA perturbations" = excel_fgsea_raw,
+    "FGSEA rescue vectors" = excel_fgsea_rescue,
+    "Overrep rescue gene sets" = excel_overrep_rescue,
+    "Overrep rescue intersections" = excel_overrep_intersections
+  ),
+  file = here("results", "gene_enrichment_analysis_results.xlsx"),
+  asTable = TRUE
+)
+```
+
+
+## RAGs and ion channels
+
+```{r}
+library(biomaRt)
+
+# mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+human = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Install packages if you haven't already
+# install.packages("httr")
+# install.packages("jsonlite")
+
+library(httr)
+library(jsonlite)
+
+# Define a function to query mygene.info for a given gene symbol (or alias)
+query_mygene <- function(query_term, scopes = "symbol,alias", species = "mouse", fields = "ensembl.gene") {
+  base_url <- "http://mygene.info/v3/query"
+
+  # Build the query parameters
+  params <- list(
+    q = query_term,
+    scopes = scopes,
+    species = species,
+    fields = fields
+  )
+
+  # Make the GET request
+  res <- POST(url = base_url, body = params, encode = "json")
+
+  # Check for a successful request (status code 200)
+  if (status_code(res) == 200) {
+    # Parse the JSON content
+    data <- fromJSON(content(res, as = "text", encoding = "UTF-8"))
+    return(data)
+  } else {
+    stop("Query failed with status: ", status_code(res))
+  }
+}
+
+# # mouse_gene_id_mapping1 <- getBM(
+# #   attributes = c("ensembl_gene_id", "external_gene_name"),
+# #   filters = c("external_gene_name"),
+# #   values = unique(rag_ion_channel_genes$gene_symbol_mouse),
+# #   mart = mouse
+# # )
+
+# # mouse_gene_id_mapping2 <- getBM(
+# #   attributes = c("ensembl_gene_id", "mgi_symbol"),
+# #   filters = c("mgi_symbol"),
+# #   values = unique(rag_ion_channel_genes$gene_symbol_mouse),
+# #   mart = mouse
+# # )
+
+# mouse_gene_id_mapping <- bind_rows(
+#   synonym = dplyr::select(
+#     mouse_gene_id_mapping1,
+#     ensembl_gene_id_mouse = ensembl_gene_id,
+#     gene_symbol_mouse = external_gene_name
+#   ),
+#   mgi_symbol = dplyr::select(
+#     mouse_gene_id_mapping2,
+#     ensembl_gene_id_mouse = ensembl_gene_id,
+#     gene_symbol_mouse = mgi_symbol
+#   )
+# )
+
+mouse_gene_id_mapping <- query_mygene(
+  unique(rag_ion_channel_genes$gene_symbol_mouse)
+) %>%
+  transmute(
+    gene_symbol_mouse = query,
+    ensembl_gene_id_mouse = map(
+      ensembl,
+      \(x) if (class(x) == "list")
+        tibble(gene = x[[1]])
+      else
+        x
+    )
+  ) %>%
+  unnest(ensembl_gene_id_mouse)
+
+mouse_homologue_mapping <- getHomologs(
+  unique(mouse_gene_id_mapping$gene),
+  "mus_musculus",
+  "homo_sapiens"
+)
+
+human_gene_id_symbol_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = unique(na.omit(mouse_homologue_mapping$hsapiens_homolog_ensembl_gene)),
+  mart = human
+)
+
+rag_ion_channel_genes_mapped <- rag_ion_channel_genes %>%
+  left_join(
+    mouse_gene_id_mapping %>%
+      dplyr::distinct(gene_symbol_mouse, ensembl_gene_id_mouse = gene),
+    by = "gene_symbol_mouse"
+  ) %>%
+  left_join(
+    mouse_homologue_mapping %>%
+      dplyr::select(
+        ensembl_gene_id_mouse = ensembl_gene_id,
+        ensembl_gene_id_human = hsapiens_homolog_ensembl_gene
+      ),
+    by = "ensembl_gene_id_mouse"
+  ) %>%
+  left_join(
+    human_gene_id_symbol_map %>%
+      dplyr::select(
+        ensembl_gene_id_human = ensembl_gene_id,
+        hgnc_symbol
+      ),
+    by = "ensembl_gene_id_human"
+  ) %>%
+  mutate(
+    gene_display_name = coalesce(
+      hgnc_symbol,
+      gene_symbol_mouse,
+      ensembl_gene_id_human,
+      ensembl_gene_id_mouse
+    )
+  ) %>%
+  group_by(gene_display_name) %>%
+  mutate(
+    unique_gene_id = if (n() > 1)
+      paste0(gene_display_name, "-", seq_len(n()))
+    else
+      gene_display_name
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r}
+rag_hm_conditions <- c(
+  "PTX", "GNE-495", "JNK-inh",
+  "GNE-495 + PTX", "JNK-inh + PTX"
+)
+
+rag_ion_channel_genes_valid <- rag_ion_channel_genes_mapped %>%
+  drop_na(
+    ensembl_gene_id_human
+  ) %>%
+  filter(ensembl_gene_id_human %in% de_long_selected$gene_id)
+
+de_rag_hm_data <- de_long_selected %>%
+  filter(
+    contrast %in% rag_hm_conditions
+  ) %>%
+  inner_join(
+    rag_ion_channel_genes_valid,
+    by = c("gene_id" = "ensembl_gene_id_human")
+  ) %>%
+  mutate(
+    signed_padj = -sign(logFC) * log10(FDR_min_zero)
+  )
+
+de_rag_hm_mat <- de_rag_hm_data %>%
+  dplyr::select(
+    unique_gene_id, contrast, logFC
+  ) %>%
+  pivot_wider(names_from = contrast, values_from = logFC) %>%
+  column_to_rownames("unique_gene_id") %>%
+  as.matrix() %>% {
+    .[
+      rag_ion_channel_genes_valid$unique_gene_id,
+      rag_hm_conditions
+    ]
+  }
+
+library(ComplexHeatmap)
+hm <- Heatmap(
+  de_rag_hm_mat,
+    # t() %>%
+    # scale() %>%
+    # t(),
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_split = rag_ion_channel_genes_valid$gene_set
+)
+
+withr::with_pdf(
+  file.path("plots", "de_heatmaps", "de_heatmap_rag_ion_channels_lfc.pdf"),
+  draw(hm),
+  width = 6, height = 10
+)
+
+de_rag_hm_mat <- de_rag_hm_data %>%
+  dplyr::select(
+    unique_gene_id, contrast, signed_padj
+  ) %>%
+  pivot_wider(names_from = contrast, values_from = signed_padj) %>%
+  column_to_rownames("unique_gene_id") %>%
+  as.matrix() %>% {
+    .[
+      rag_ion_channel_genes_valid$unique_gene_id,
+      rag_hm_conditions
+    ]
+  }
+
+library(ComplexHeatmap)
+hm <- Heatmap(
+  # de_rag_hm_mat,
+  # Clamp to -10 to 10
+  de_rag_hm_mat %>% {
+    pmax(pmin(., 10), -10)
+  },
+  name = "-sign(log2FC) * log10(padj)",
+
+    # t() %>%
+    # scale() %>%
+    # t(),
+  col = circlize::colorRamp2(seq(-10, 10, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  row_split = rag_ion_channel_genes_valid$gene_set
+)
+
+withr::with_pdf(
+  file.path("plots", "de_heatmaps", "de_heatmap_rag_ion_channels_padj.pdf"),
+  draw(hm),
+  width = 6, height = 10
+)
+
+hm <- Heatmap(
+  de_rag_hm_mat,
+  # Clamp to -10 to 10
+  # de_rag_hm_mat %>% {
+  #   pmax(pmin(., 10), -10)
+  # },
+  name = "-sign(log2FC) * log10(padj)",
+
+    # t() %>%
+    # scale() %>%
+    # t(),
+  col = circlize::colorRamp2(seq(-10, 10, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  row_split = rag_ion_channel_genes_valid$gene_set
+)
+
+withr::with_pdf(
+  file.path("plots", "de_heatmaps", "de_heatmap_rag_ion_channels_padj2.pdf"),
+  draw(hm),
+  width = 6, height = 10
+)
+```
+
+Overlap of RAGs and ion channels with GNE-495-only rescue genes
+
+
+```{r}
+
+
+
+```
+
 

@@ -455,6 +455,11 @@ ptx_rescue_list_long <- ptx_rescue_list_neat %>%
     values_to= "rescue"
   )
 
+write_csv(
+  ptx_rescue_list_long,
+  "ptx_rescue_list_long.csv.gz"
+)
+
 ptx_rescue_type_list <- ptx_rescue_list_long %>%
   pivot_wider(
     names_from = compound,
@@ -469,6 +474,11 @@ ptx_rescue_type_list <- ptx_rescue_list_long %>%
       TRUE ~ "no rescue"
     )
   )
+
+write_csv(
+  ptx_rescue_type_list,
+  "ptx_rescue_type_list.csv.gz"
+)
 ```
 
 
@@ -785,6 +795,7 @@ qsave(
   fgsea_pert_res,
   "fgsea_pert_res.qs"
 )
+fgsea_pert_res <- qread("fgsea_pert_res.qs")
 ```
 
 
@@ -835,7 +846,7 @@ cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
 
 
 ```{r}
-fgsea_res_mat <- fgsea_res %>%
+fgsea_res_mat <- fgsea_pert_res %>%
   transmute(comparison_unique, pathway, signed_padj = -sign(NES)*log10(padj)) %>%
   pivot_wider(
     names_from = comparison_unique,
@@ -1460,6 +1471,65 @@ clue_job <- clue_query_submit(
   "PTX rescue conditions BING"
 )
 clue_query_wait(clue_job)
+
+clue_res_path <- clue_query_download(clue_job, file.path("results", "clue_res_rescue_gene_sets.tar.gz"))
+clue_res_raw <- clue_parse_result(
+  clue_res_path,
+  score_level = "summary",
+  score_type = "tau"
+)
+```
+
+### Clue query heatmap
+
+```{r}
+hm_conditions <- c(
+  "PTX", "GNE-495 + PTX", "JNK-inh + PTX", "GNE-495", "JNK-inh"
+)
+
+clue_res_kd_data <- clue_res_raw %>%
+  filter(
+    gene_set %in% hm_conditions
+  ) %>%
+  group_by(
+    pert_id
+  ) %>%
+  filter(
+    pert_type %in% c("trt_sh.cgs"),
+    # any(abs(tau) > .9)
+    abs(tau[gene_set == "PTX"]) > 90
+  ) %>%
+  ungroup()
+
+clue_res_kd_mat <- clue_res_kd_data %>%
+  dplyr::select(pert_iname, gene_set, tau) %>%
+  pivot_wider(
+    names_from = gene_set,
+    values_from = tau
+  ) %>%
+  column_to_rownames("pert_iname") %>%
+  as.matrix() %>% {
+    .[, hm_conditions]
+  }
+
+hm <- Heatmap(
+  clue_res_kd_mat,
+  name = "Tau",
+  col = circlize::colorRamp2(
+    seq(from = -100, to = 100, length.out = 51),
+    paletteer::paletteer_c("pals::ocean.balance", n = 51)
+  ),
+  cluster_rows = cluster_mat,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  use_raster = TRUE,
+)
+
+withr::with_pdf(
+  file.path("plots", "clue_res_kd_heatmap.pdf"),
+  draw(hm),
+  width = 12, height = 12
+)
 ```
 
 
@@ -2909,7 +2979,9 @@ synStoreMany(
     "de_long_selected.csv.gz",
     "feasible_genes.csv.gz",
     "ptx_rescue_overrepresentation.qs",
-    "ptx_rescue_intersections_overrepresentation.qs"
+    "ptx_rescue_intersections_overrepresentation.qs",
+    "ptx_rescue_list_long.csv.gz",
+    "ptx_rescue_type_list.csv.gz"
   ),
   parentId = analysis_syn,
   forceVersion = FALSE
