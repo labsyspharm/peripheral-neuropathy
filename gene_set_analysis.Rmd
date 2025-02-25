@@ -13,6 +13,11 @@ library(synExtra)
 library(qs)
 library(powerjoin)
 
+library(conflicted)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(base::setdiff)
+
 synapser::synLogin()
 syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
 ```
@@ -86,6 +91,8 @@ write_csv(
 ```
 
 
+## Reading raw counts
+
 ```{r}
 raw_counts <- syn("syn63854604") %>%
   read_csv()
@@ -119,6 +126,8 @@ write_csv(
   "feasible_genes.csv.gz"
 )
 ```
+
+## Transform counts
 
 ```{r}
 de_meta <- raw_counts_long %>%
@@ -262,7 +271,7 @@ pwalk(
 ```
 
 
-PTX rescue
+## PTX rescue data
 
 ```{r}
 clamp_symbols <- \(x, symbols, threshold) {
@@ -385,7 +394,7 @@ ggsave(
 )
 ```
 
-
+## Define rescue types
 
 Make alluvial diagram of PTX rescue
 
@@ -487,8 +496,8 @@ rescue_type_colors = c(
   both = "purple",
   `JNK-inh only` = "red",
   `GNE-495 only` = "blue",
-  `no rescue` = "black",
-  `not perturbed` = "gray50"
+  `no rescue` = "gray20",
+  `not perturbed` = "gray80"
 )
 ```
 
@@ -568,10 +577,10 @@ p <- ggplot(
   scale_color_manual(
     values = rescue_type_colors
   ) +
-  ggh4x::facet_grid2(
-    rescue_definition ~ contrast_2,
-    scales = "free", axes = "all"
+  facet_grid(
+    rescue_definition ~ contrast_2
   ) +
+  coord_equal() +
   labs(
     x = "log2(fold-change) Paclitaxel",
     y = "log2(fold-change) Rescue",
@@ -581,7 +590,7 @@ p <- ggplot(
 dir.create("plots", showWarnings = FALSE)
 ggsave(
   file.path("plots", "ptx_rescue_scatter_logFC_w_rescue_type_all.pdf"),
-  p, width = 8, height = 8, device = cairo_pdf
+  p, width = 8, height = 12, device = cairo_pdf
 )
 ```
 
@@ -619,8 +628,6 @@ msigdbr_of_interest_gs <- msigdbr_of_interest %>%
 ```
 
 ## FGSEA
-
-###
 
 Linear scale most rescued by agent to most not rescued. Only including
 genes perturbed by PTX
@@ -1414,7 +1421,8 @@ qsave(
 
 ### Clue queries on rescue gene sets
 
-Requiring padj < .05, using 150 most significant genes for the query
+Requiring padj < .05, using 150 most significant genes for the query and only
+query with BING genes
 
 ```{r}
 library(cluequery)
@@ -1478,6 +1486,11 @@ clue_res_raw <- clue_parse_result(
   score_level = "summary",
   score_type = "tau"
 )
+
+write_csv(
+  clue_res_raw,
+  file.path("results", "clue_res_rescue_gene_sets.csv.gz")
+)
 ```
 
 ### Clue query heatmap
@@ -1533,13 +1546,7 @@ withr::with_pdf(
 ```
 
 
-### PTX barplot
-
-```{r}
-
-
-```
-
+## TopGO plots
 
 
 ```{r}
@@ -2226,7 +2233,7 @@ chea3_res %>%
   View()
 ```
 
-
+## Chea3
 
 ```{r}
 chea3_submit <- function(N  , name = "myquery") {
@@ -2410,6 +2417,7 @@ chea3_res %>%
   View()
 ```
 
+## Plot selected gene counts
 
 ```{r}
 fpkm_raw <- syn("syn63854603") %>%
@@ -2950,11 +2958,92 @@ ggsave(
 )
 ```
 
-## Excel table
+## INDRA queries
 
 ```{r}
+library(indra.gsea)
+library(biomaRt)
 
+ensembl <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl"
+)
 
+hgnc_mapping <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "hgnc_id",
+    "hgnc_symbol"
+  ),
+  filters = "ensembl_gene_id",
+  values = unique(ptx_rescue_type_list$gene_id),
+  mart = ensembl
+) %>%
+  as_tibble() %>%
+  mutate(
+    across(hgnc_id, \(x) str_remove(x, "HGNC:"))
+  ) %>%
+  # Remove empty HGNC IDs
+  filter(hgnc_id != "") %>%
+  distinct()
+
+ptx_rescue_type_indra_raw <- ptx_rescue_type_list %>%
+  filter(rescue_definition == "significant_opposite") %>%
+  # Join with HGNC mapping
+  inner_join(
+    hgnc_mapping,
+    by = c("gene_id" = "ensembl_gene_id")
+  ) %>%
+  group_by(perturbed, rescue_type) %>%
+  summarize(
+    res = list(
+      safely(indra_discrete_gsea)(
+        hgnc_id,
+        minimum_evidence_count = 2,
+        indra_path_analysis = TRUE
+      )
+    ),
+    .groups = "drop"
+  )
+
+ptx_rescue_type_indra_raw %>%
+  mutate(
+    errored = map_lgl(res, \(x) !is.null(x$error))
+  )
+
+ptx_rescue_type_indra_res <- ptx_rescue_type_indra_raw %>%
+  mutate(
+    res = map(res, "result")
+  ) %>%
+  filter(map_lgl(res, \(x) !is.null(x))) %>%
+  mutate(
+    res = map(res, \(x) bind_rows(x, .id = "query_type"))
+  ) %>%
+  unnest(res)
+
+write_csv(
+  ptx_rescue_type_indra_res,
+  "indra_res.csv.gz"
+)
+
+ptx_rescue_type_indra_res %>%
+  filter(rescue_type == "GNE-495 only", perturbed == "down", query_type == "indra-upstream", str_starts(curie, fixed("hgnc"))) %>%
+  arrange(q) %>%
+  View()
+
+ptx_rescue_type_list %>%
+  filter(
+    rescue_definition == "significant_opposite",
+    perturbed == "down",
+    rescue_type == "GNE-495 only"
+  ) %>%
+  inner_join(
+    hgnc_mapping,
+    by = c("gene_id" = "ensembl_gene_id")
+  ) %>%
+  pull("hgnc_symbol") %>%
+  unique() %>%
+  clipr::write_clip()
 ```
 
 ## Save to synapse
@@ -2981,7 +3070,15 @@ synStoreMany(
     "ptx_rescue_overrepresentation.qs",
     "ptx_rescue_intersections_overrepresentation.qs",
     "ptx_rescue_list_long.csv.gz",
-    "ptx_rescue_type_list.csv.gz"
+    "ptx_rescue_type_list.csv.gz",
+    "indra_res.csv.gz",
+    file.path(
+      "results",
+      c(
+        "clue_res_rescue_gene_sets.csv.gz",
+        "clue_res_rescue_gene_sets.tar.gz"
+      )
+    )
   ),
   parentId = analysis_syn,
   forceVersion = FALSE

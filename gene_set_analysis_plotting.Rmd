@@ -1712,33 +1712,6 @@ query_mygene <- function(query_term, scopes = "symbol,alias", species = "mouse",
   }
 }
 
-# # mouse_gene_id_mapping1 <- getBM(
-# #   attributes = c("ensembl_gene_id", "external_gene_name"),
-# #   filters = c("external_gene_name"),
-# #   values = unique(rag_ion_channel_genes$gene_symbol_mouse),
-# #   mart = mouse
-# # )
-
-# # mouse_gene_id_mapping2 <- getBM(
-# #   attributes = c("ensembl_gene_id", "mgi_symbol"),
-# #   filters = c("mgi_symbol"),
-# #   values = unique(rag_ion_channel_genes$gene_symbol_mouse),
-# #   mart = mouse
-# # )
-
-# mouse_gene_id_mapping <- bind_rows(
-#   synonym = dplyr::select(
-#     mouse_gene_id_mapping1,
-#     ensembl_gene_id_mouse = ensembl_gene_id,
-#     gene_symbol_mouse = external_gene_name
-#   ),
-#   mgi_symbol = dplyr::select(
-#     mouse_gene_id_mapping2,
-#     ensembl_gene_id_mouse = ensembl_gene_id,
-#     gene_symbol_mouse = mgi_symbol
-#   )
-# )
-
 mouse_gene_id_mapping <- query_mygene(
   unique(rag_ion_channel_genes$gene_symbol_mouse)
 ) %>%
