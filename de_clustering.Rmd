@@ -1,0 +1,169 @@
+---
+title: "Peripheral neuropathy clustering differentially expressed genes"
+author: "Clemens Hug"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Reading DEA results
+
+DEA performed by Riki Kawaguchi from UCLA
+
+```{r}
+de <- syn("syn64582734") %>%
+  read_csv()
+
+rescue_list <- syn("syn64608137") %>%
+  read_csv()
+
+rescue_type_list <- syn("syn64608138") %>%
+  read_csv()
+```
+
+
+
+
+```{r}
+library(seriation)
+library(ComplexHeatmap)
+
+cluster_df <- function(df, row_var, col_var, value_var, values_fill = 0) {
+  # browser()
+  mat <- df %>%
+    select({{row_var}}, {{col_var}}, {{value_var}}) %>%
+    pivot_wider(names_from = {{col_var}}, values_from = {{value_var}}, values_fill = values_fill) %>%
+    column_to_rownames(rlang::as_name(rlang::enquo(row_var)))
+  # browser()
+  if (rlang::is_bare_numeric(pull(df, {{value_var}}))) {
+    dist_rows <- dist(mat, method = "euclidian")
+    dist_cols <- dist(t(mat), method = "euclidian")
+  } else {
+    # browser()
+    dist_rows <- cluster::daisy(mat, metric = "gower")
+    dist_cols <- t(mat) %>%
+      as.data.frame() %>%
+      mutate(across(everything(), \(x) factor(x, levels = levels(pull(df, {{value_var}}))))) %>%
+      cluster::daisy(metric = "gower")
+  }
+  clust_rows <- hclust(dist_rows, method = "average") %>%
+      reorder(dist_rows, method = "olo")
+  clust_cols <- hclust(dist_cols, method = "average") %>%
+      reorder(dist_cols, method = "olo")
+  df %>%
+    mutate(
+      "{{row_var}}" := factor({{row_var}}, levels = clust_rows$labels[clust_rows$order]),
+      "{{col_var}}" := factor({{col_var}}, levels = clust_cols$labels[clust_cols$order])
+    )
+}
+
+
+cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
+  # if (!sample_in_col) {
+  #   mat <- t(mat)
+  # }
+  # mat_imp <- impute.knn(
+  #   mat, rng.seed = 42
+  # )[["data"]]
+  # if (!sample_in_col) {
+  #   mat_imp <- t(mat_imp)
+  #   mat <- t(mat)
+  # }
+  # browser()
+  dist_mat <- dist(mat)
+  # dist_mat <- as.dist(mat)
+  clust <- hclust(dist_mat, method = "average")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
+```
+
+
+```{r}
+hm_contrasts <- c(
+  "PTX", "GNE-495", "JNK-inh",
+  "GNE-495 + PTX", "JNK-inh + PTX"
+)
+
+hm_genes <- de %>%
+  filter(
+    FDR < 0.05
+  ) %>%
+  distinct(gene_id)
+```
+
+```{r}
+hm_mat <- de %>%
+  semi_join(hm_genes) %>%
+  filter(contrast %in% hm_contrasts) %>%
+  select(gene_id, contrast, logFC) %>%
+  pivot_wider(names_from = contrast, values_from = logFC) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix() %>% {
+    .[, hm_contrasts]
+  }
+
+hm_mat_scaled <- hm_mat %>%
+  t() %>%
+  scale(scale = TRUE, center = FALSE) %>%
+  t()
+
+row_meta <- rescue_type_list %>%
+  filter(
+    gene_id %in% rownames(hm_mat),
+    rescue_definition == "significant_opposite"
+  ) %>%
+  select(
+    gene_id,
+    direction = perturbed,
+    rescue_type
+  ) %>%
+  column_to_rownames("gene_id") %>%
+  as.data.frame() %>% {
+    .[rownames(hm_mat), ]
+  }
+
+row_clust <- cluster_fun_eucl(hm_mat_scaled, sample_in_col = TRUE)
+
+mat_max_abs <- max(abs(quantile(hm_mat_scaled, c(.025, .975), na.rm = TRUE)))
+hm <- Heatmap(
+  hm_mat_scaled,
+  col = circlize::colorRamp2(seq(from = -mat_max_abs, to = mat_max_abs, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
+  show_column_names = TRUE,
+  show_row_names = FALSE,
+  cluster_rows = row_clust,
+  cluster_columns = FALSE,
+  use_raster = TRUE,
+  raster_device = "agg_png",
+  right_annotation = HeatmapAnnotation(
+    df = row_meta,
+    which = "row",
+    col = list(
+      direction = c("up" = "red", "down" = "blue", "not perturbed" = "white"),
+      rescue_type = c(
+        "both" = "purple", "no rescue" = "grey",
+        "GNE-495 only" = "blue", "JNK-inh only" = "red",
+        "not perturbed" = "white"
+      )
+    )
+  ),
+  show_row_dend = FALSE
+)
+
+withr::with_pdf(
+  file.path("plots", "de_heatmaps", "all_de_genes.pdf"),
+  draw(hm),
+  width = 7, height = 15
+)
+```
