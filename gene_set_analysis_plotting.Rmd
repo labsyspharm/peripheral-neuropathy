@@ -42,7 +42,14 @@ fgsea_overrep <- syn("syn64582959") %>%
   qread()
 
 fgsea_intersection_overrep <- syn("syn64586672") %>%
-  qread()
+  qread() %>%
+  mutate(
+    # avoid weird fucking bug when grouping that values are repeated
+    across(estimate, unname)
+  )
+
+indra_res <- syn("syn64908970") %>%
+  read_csv()
 
 rag_ion_channel_genes <- syn("syn64745787") %>%
   readxl::read_excel() %>%
@@ -638,7 +645,7 @@ withr::with_pdf(
   width = 6, height = 8
 )
 
-InteractiveComplexHeatmap::htShiny(hm, save = here("plots/reactome_pert_heatmap_k8"))
+InteractiveComplexHeatmap::htShiny(draw(hm), save = here("plots/reactome_pert_heatmap_k8"))
 ```
 
 
@@ -839,6 +846,7 @@ htmlwidgets::saveWidget(
 
 
 ## Plot LFC heatmap of genes in enriched pathways PTX vs combo
+
 ```{r}
 library(msigdbr)
 all_msigdbr <- msigdbr()
@@ -859,8 +867,23 @@ msigdbr_of_interest <- all_msigdbr %>%
     gs_name,
     delim = "_",
     names = c("database", "pathway"),
-    too_many = "merge"
+    too_many = "merge",
+    cols_remove = FALSE
   )
+
+msigdbr_of_interest_mat <- msigdbr_of_interest %>%
+  transmute(gs_name, gene_symbol, dummy = TRUE) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = gs_name,
+    values_from = dummy,
+    values_fill = FALSE
+  ) %>%
+  column_to_rownames("gene_symbol") %>%
+  as.matrix()
+
+msigdbr_of_interest_sim <- msigdbr_of_interest_mat %>%
+  proxy::dist(method = "Jaccard", by_rows = FALSE)
 ```
 
 
@@ -878,9 +901,66 @@ de_pert_hm_data <- de_long_selected %>%
     signed_padj = -sign(logFC) * log10(FDR_min_zero)
   )
 
+gene_id_gene_symbol_map <- de_pert_hm_data %>%
+  distinct(gene_id, gene_name) %>%
+  {with(., set_names(gene_name, gene_id))}
+
+plot_pathway_heatmap <- function(pathway) {
+  gene_sets <- msigdbr_of_interest %>%
+    filter(pathway == !!pathway) %>%
+    pull(ensembl_gene) %>%
+    unique()
+
+  de_mat <- de_pert_hm_data %>%
+    filter(gene_id %in% gene_sets) %>%
+    select(gene_id, contrast, logFC) %>%
+    pivot_wider(names_from = contrast, values_from = logFC, values_fill = 0) %>%
+    column_to_rownames("gene_id") %>%
+    as.matrix() %>% {
+      .[, fgsea_hm_conditions]
+    }
+
+  row_meta <- fgsea_res_rescue_data %>%
+    filter(pathway == !!pathway) %>%
+    select(compound, gene_id = leadingEdge) %>%
+    unchop(gene_id) %>%
+    mutate(
+      gene_id = factor(gene_id, levels = rownames(de_mat)),
+      decoy = 1L
+    ) %>%
+    pivot_wider(
+      names_from = compound, values_from = decoy,
+      names_prefix = "leading_edge_",
+      id_expand = TRUE, values_fill = 0L
+    ) %>%
+    column_to_rownames("gene_id") %>% {
+      .[rownames(de_mat), ]
+    }
+
+  mat_max_abs <- max(abs(quantile(de_mat, c(.025, .975), na.rm = TRUE)))
+
+  hm <- Heatmap(
+    de_mat,
+    name = "log2 fold change",
+    col = circlize::colorRamp2(seq(from = -mat_max_abs, to = mat_max_abs, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
+    cluster_rows = cluster_fun_eucl,
+    cluster_columns = FALSE,
+    row_labels = gene_id_gene_symbol_map[rownames(de_mat)],
+    right_annotation = HeatmapAnnotation(
+      df = row_meta,
+      which = "row"
+    )
+  )
+
+  return(hm)
+}
+
+plot_pathway_heatmap("METABOLISM_OF_LIPIDS")
+
 library(ComplexHeatmap)
 de_pert_rescue_hm_data <- tibble(
   pathway = c(
+    "METABOLISM_OF_LIPIDS",
     "RECYCLING_PATHWAY_OF_L1",
     "REGULATION_OF_EXPRESSION_OF_SLITS_AND_ROBOS",
     "SRP_DEPENDENT_COTRANSLATIONAL_PROTEIN_TARGETING_TO_MEMBRANE",
@@ -975,6 +1055,11 @@ pwalk(
 ### Plotting single conditions as bars
 
 ```{r}
+bar_plot_colors <- c(
+  up = "#d73027",
+  down = "#4575b4"
+)
+
 fgsea_overrep_data <- fgsea_overrep %>%
   separate_wider_delim(
     pathway,
@@ -1020,7 +1105,9 @@ ps <- fgsea_overrep_data %>%
             ),
             size = 2
           ) +
-          scale_fill_discrete(guide = "none", direction = -1) +
+          scale_fill_manual(
+            values = alpha(bar_plot_colors, .7)
+          ) +
           theme(
             axis.text.y = element_blank(),
             panel.grid.major.y = element_blank(),
@@ -1153,7 +1240,7 @@ ps <- fgsea_intersection_overrep_data %>%
           ) %>%
           ggplot(
             aes(
-              x = estimate,
+              x = signed_padj,
               y = pathway_db_direction,
               fill = perturbed
             )
@@ -1167,7 +1254,9 @@ ps <- fgsea_intersection_overrep_data %>%
             ),
             size = 2
           ) +
-          scale_fill_discrete(guide = "none", direction = -1) +
+          scale_fill_manual(
+            values = alpha(bar_plot_colors, .7)
+          ) +
           theme(
             axis.text.y = element_blank(),
             panel.grid.major.y = element_blank(),
@@ -1198,6 +1287,314 @@ pwalk(
 )
 
 ```
+
+### Dot plot
+
+
+```{r}
+
+fgsea_intersection_dotplot_data <- fgsea_intersection_overrep_data %>%
+  mutate(
+    padj_fgsea_bin = cut(
+      padj_fgsea,
+      breaks = c(0, .01, .05, 1),
+      labels = c("FDR < 0.01", "0.01 < FDR < 0.05", "ns")
+    )
+  ) %>%
+  filter(
+    rescue_type %in% c("GNE-495 only", "JNK-inh only"),
+    perturbed %in% c("up", "down")
+  ) %>%
+  # inner_join(
+  #   fgsea_intersection_overrep_data_single,
+  #   by = c("rescue_definition", "rescue_type", "pathway_db")
+  # ) %>%
+  # mutate(
+  #   directed_estimate = if_else(direction == "up", estimate, -estimate)
+  # ) %>%
+  group_nest(
+    rescue_definition
+  ) %>%
+  mutate(
+    p = map(
+      data,
+      \(x) {
+        d <- group_by(
+          x,
+          pathway_db
+        ) %>%
+          filter(
+            any(padj_fgsea < .01)
+          ) %>%
+          ungroup()
+        dmats <- d %>%
+          select(rescue_type, pathway_db, perturbed, estimate) %>%
+          arrange(pathway_db) %>%
+          split(.$perturbed) %>%
+          map(
+            \(y) select(y, -perturbed) %>%
+              pivot_wider(
+                names_from = rescue_type,
+                values_from = estimate
+              ) %>%
+              column_to_rownames("pathway_db") %>%
+              as.matrix() %>%
+              dist()
+          )
+        dmat <- reduce(dmats, `+`)
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        # browser()
+        ggplot(
+          d %>%
+            mutate(
+              pathway_db = factor(pathway_db, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = rescue_type,
+            y = pathway_db,
+            color = estimate,
+            size = padj_fgsea_bin
+          )
+        ) +
+          geom_point(shape = 16) +
+          scale_color_viridis_c(trans = "pseudo_log") +
+          scale_size_manual(
+            values = c("FDR < 0.01" = 4, "0.01 < FDR < 0.05" = 2, "ns" = 1)
+          ) +
+          # scale_color_distiller(palette = "RdBu") +
+          facet_wrap(~perturbed)
+      }
+    )
+  )
+```
+
+```{r}
+
+flag_similar_adjacent_leaves <- function(clust, sim_matrix, threshold) {
+  # Get the dendrogram representation
+  dend <- as.dendrogram(clust)
+
+  # Function to find adjacent leaves and check their similarity
+  find_adjacent_pairs <- function(node, parent_leaves = NULL) {
+    if (is.leaf(node)) {
+      # For leaf nodes, return the label
+      return(list(leaves = labels(node), pairs = data.frame()))
+    } else {
+      # For internal nodes, process left and right children
+      left_result <- find_adjacent_pairs(node[[1]], parent_leaves)
+      right_result <- find_adjacent_pairs(node[[2]], left_result$leaves)
+
+      # Combine leaves from both children
+      all_leaves <- c(left_result$leaves, right_result$leaves)
+
+      # Identify pairs of leaves that are adjacent across the left-right boundary
+      # (the rightmost leaf of left subtree and leftmost leaf of right subtree)
+      boundary_pairs <- data.frame(
+        leaf1 = tail(left_result$leaves, 1),
+        leaf2 = head(right_result$leaves, 1),
+        stringsAsFactors = FALSE
+      )
+
+      # Calculate similarity for these boundary pairs
+      if (nrow(boundary_pairs) > 0) {
+        boundary_pairs$similarity <- sim_matrix[boundary_pairs$leaf1, boundary_pairs$leaf2]
+        # Flag pairs below threshold
+        boundary_pairs <- boundary_pairs[boundary_pairs$similarity <= threshold, ]
+      }
+
+      # Combine all pairs found
+      all_pairs <- rbind(left_result$pairs, right_result$pairs, boundary_pairs)
+
+      return(list(leaves = all_leaves, pairs = all_pairs))
+    }
+  }
+
+  # Start the recursive search
+  result <- find_adjacent_pairs(dend)
+
+  return(result$pairs)
+}
+
+
+```
+
+```{r}
+msigdbr_of_interest_sim_trans <- msigdbr_of_interest_sim
+attr(msigdbr_of_interest_sim_trans, "Labels") <- distinct(
+  msigdbr_of_interest, gs_name, database, pathway
+) %>%
+  transmute(
+    pathway_db = paste(str_sub(database, 1, 1), pathway, sep = "_"),
+    gs_name
+  ) %>%
+  slice(match(labels(msigdbr_of_interest_sim_trans), gs_name)) %>%
+  pull(pathway_db)
+msigdbr_of_interest_sim_trans <- as.matrix(msigdbr_of_interest_sim_trans)
+
+fgsea_intersection_overrep_data_single <- fgsea_intersection_overrep_data %>%
+  filter(
+    perturbed %in% c("up", "down")
+  ) %>%
+  group_by(
+    rescue_definition, rescue_type, database, pathway_db, pathway
+  ) %>%
+  summarize(
+    direction = case_when(
+      all(padj_fgsea >= .01) ~ "none",
+      padj_fgsea[1] < .2 * padj_fgsea[2] | padj_fgsea[2] < .2 * padj_fgsea[1] ~ perturbed[which.min(padj_fgsea)],
+      TRUE ~ "both"
+    ),
+    estimate = estimate[order(padj_fgsea)[1]],
+    padj_fgsea = min(padj_fgsea),
+    # estimate = estimate[which.min(padj_fgsea)],
+    .groups = "drop"
+  )
+
+fgsea_blacklist <- c(
+  "HCMV EARLY EVENTS",
+  "INFECTIOUS DISEASE"
+)
+
+fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single %>%
+  mutate(
+    padj_fgsea_bin = cut(
+      padj_fgsea,
+      breaks = c(0, .001, .01, 1),
+      labels = c("FDR < 0.001", "FDR < 0.01", "ns")
+    ),
+    # across(
+    #   pathway_db,
+    #   \(x) str_remove_all(
+    #     x, coll("_")
+    #   ) %>%
+    #     str_sub(start = 3)
+    # )
+  ) %>%
+  filter(
+    !database %in% c("KEGG"),
+    rescue_type %in% c("GNE-495 only", "JNK-inh only"),
+  ) %>%
+  mutate(
+    directed_estimate = if_else(direction == "up", estimate, -estimate)
+  ) %>%
+  group_nest(
+    rescue_definition
+  ) %>%
+  crossing(
+    p_threshold = c(0.005, 0.001, .01)
+  ) %>%
+  mutate(
+    res = map2(
+      data, p_threshold,
+      \(x, y) {
+        # browser()
+        d <- group_by(
+          x,
+          pathway_db
+        ) %>%
+          filter(
+            any(padj_fgsea < y)
+          ) %>%
+          ungroup()
+        dwide <- d %>%
+          select(rescue_type, pathway_db, directed_estimate) %>%
+          arrange(pathway_db) %>%
+          pivot_wider(
+            names_from = rescue_type,
+            values_from = directed_estimate
+          )
+        dmat <- dwide %>%
+          column_to_rownames("pathway_db") %>%
+          as.matrix() %>%
+          dist()
+        # browser()
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        row_labels <- clust$labels[clust$order] %>% {
+          set_names(
+            str_replace_all(., coll("_"), " ") %>%
+              str_sub(start = 2),
+            .
+          )
+        }
+        sim_hm <- msigdbr_of_interest_sim_trans[
+          clust$labels[clust$order], clust$labels[clust$order]
+        ] %>%
+          pheatmap(
+            cluster_rows = FALSE,
+            cluster_cols = FALSE
+          )
+        est_perc <- quantile(d$directed_estimate, c(.05, .95))
+        abs_max_est_perc <- max(abs(est_perc))
+        p <- ggplot(
+          d %>%
+            mutate(
+              pathway_db = factor(pathway_db, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = rescue_type,
+            y = pathway_db,
+            color = directed_estimate,
+            size = padj_fgsea_bin
+          )
+        ) +
+          geom_point(shape = 16) +
+          # scale_color_viridis_c(trans = "pseudo_log") +
+          # scale_color_distiller(
+          #   limits = c(-abs_max_est_perc, abs_max_est_perc),
+          #   palette = "RdYlBu", trans = "pseudo_log",
+          #   oob = scales::squish
+          # ) +
+          paletteer::scale_color_paletteer_c(
+            palette = "pals::ocean.balance",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish
+          ) +
+          scale_size_manual(
+            values = rev(c("FDR < 0.001" = 6, "FDR < 0.01" = 4, "ns" = 2))
+          ) +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(
+            breaks = names(row_labels),
+            labels = unname(row_labels)
+          ) +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 0)
+          ) +
+          labs(
+            x = "Rescue by",
+            y = NULL,
+            color = "Rescue of\ngenes",
+            size = NULL
+          )
+        list(
+          p = p,
+          sim_hm = sim_hm
+        )
+      }
+    )
+  ) %>%
+  select(-data) %>%
+  unnest_wider(
+    res,
+    strict = FALSE
+  )
+
+flag_similar_adjacent_leaves(clust, msigdbr_of_interest_sim_trans, .6)
+
+pwalk(
+  fgsea_intersection_dotplot_data_single,
+  \(p, rescue_definition, p_threshold, ...) {
+    ggsave(
+      file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, ".pdf")),
+      p, width = 9.8, height = 9
+    )
+  }
+)
+ ```
+
+
 
 ### intersections versus each other and vs PTX
 
@@ -1287,6 +1684,35 @@ pwalk(
     )
   }
 )
+
+fgsea_intersection_overrep_gne_vs_jnk <- fgsea_intersection_overrep_data %>%
+  filter(
+    rescue_definition == "significant_opposite",
+    perturbed %in% c("up", "down"),
+    rescue_type %in% c("GNE-495 only", "JNK-inh only")
+  ) %>%
+  select(
+    perturbed, rescue_type, database, pathway, pathway_db, pathway_db_direction,
+    signed_padj, estimate
+  ) %>%
+  pivot_wider(
+    names_from = rescue_type,
+    values_from = c(signed_padj, estimate)
+  )
+
+p <- fgsea_intersection_overrep_gne_vs_jnk %>%
+  ggplot(
+    aes(
+      x = `signed_padj_JNK-inh only`,
+      y = `signed_padj_GNE-495 only`,
+      text = pathway_db
+    )
+  ) +
+  geom_point()
+
+p
+
+plotly::ggplotly(p)
 ```
 
 
@@ -1910,3 +2336,86 @@ Overlap of RAGs and ion channels with GNE-495-only rescue genes
 ```
 
 
+### INDRA plots
+
+```{r}
+idnra_res_plot_data <- indra_res %>%
+  filter(
+    rescue_type %in% c(
+      "GNE-495 only", "JNK-inh only"
+    ),
+    str_starts(query_type, fixed("indra"))
+  ) %>%
+  mutate(
+    signed_q = if_else(
+      perturbed == "down",
+      1, -1
+    ) * log10(q)
+  ) %>%
+  separate_wider_delim(
+    curie,
+    delim = ":",
+    names = c("database", "id")
+  ) %>%
+  filter(
+    database %in% c("fplx", "hgnc"),
+    q < .01
+  ) %>%
+  mutate(
+    sign = if_else(perturbed == "up", "pos", "neg")
+  )
+
+ps <- idnra_res_plot_data %>%
+  group_nest(
+    rescue_type, query_type
+  ) %>%
+  mutate(
+    p = map2(
+      rescue_type, data,
+      \(x, y) {
+        y %>%
+          mutate(
+            name = fct_reorder(name, signed_q)
+          ) %>%
+          ggplot(
+            aes(
+              x = signed_q,
+              y = name,
+              fill = sign
+            )
+          ) +
+          geom_col() +
+          geom_text(
+            aes(
+              x = if_else(sign == "pos", -.05, .05),
+              hjust = if_else(sign == "pos", 1, 0),
+              label = name
+            ),
+            size = 2
+          ) +
+          scale_fill_discrete(guide = "none", direction = -1) +
+          theme(
+            axis.text.y = element_blank(),
+            panel.grid.major.y = element_blank(),
+          ) +
+          labs(
+            x = "Signed log10 p-value",
+            y = NULL,
+            title = paste0(query_type, " analysis of genes rescued by ", x),
+            subtitle = "FDR < 0.01"
+          )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(rescue_type, query_type, p, ...) {
+    ggsave(
+      file.path("plots", paste0(query_type, "_", rescue_type, "_bars.pdf")),
+      p, width = 8, height = 8
+    )
+  }
+)
+
+```
