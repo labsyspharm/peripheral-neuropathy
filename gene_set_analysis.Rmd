@@ -205,25 +205,67 @@ rlog_scaled2 <- {
 ## Volcano plot
 
 ```{r}
+compute_point_density <- function(df, x_col, y_col, ...) {
+  x <- df[[x_col]]
+  y <- df[[y_col]]
+
+  # Use more robust bandwidth estimation
+  bw_x <- diff(quantile(x, c(0.25, 0.75))) / 1.34 * 2
+  bw_y <- diff(quantile(y, c(0.25, 0.75))) / 1.34 * 2
+
+
+  # Compute the 2D kernel density
+  kde <- MASS::kde2d(
+    x, y,
+    h = c(bw_x, bw_y),
+    lims = c(
+      range(x) + c(-1, 1) * bw_x,
+      range(y) + c(-1, 1) * bw_y
+    ),
+    ...
+  )
+
+  # Find density at each point by interpolation
+  point_density <- fields::interp.surface(
+    obj = list(x = kde$x, y = kde$y, z = kde$z),
+    loc = cbind(x, y)
+  )
+
+  df %>%
+    mutate(.density = point_density)
+}
+
+de_long_selected %>%
+  compute_point_density("logFC", "signed_padj")
+
 ps <- de_long_selected %>%
   group_nest(contrast) %>%
   mutate(
     p = pmap(
       .,
       \(contrast, data, ...) {
+        p_data <- data %>%
+          mutate(
+            nlog10_FDR = -log10(FDR)
+          ) %>%
+          filter(is.finite(nlog10_FDR)) %>%
+          compute_point_density("logFC", "nlog10_FDR", n = 100)
+
         ggplot(
-          data %>%
+          p_data %>%
             arrange(
               match(perturbed, c("not perturbed", "down", "up"))
             ),
           aes(
             x = logFC,
-            y = -log10(FDR)
+            y = nlog10_FDR,
+            text = gene_name
           )
         ) +
           geom_point(
             aes(color = perturbed),
-            alpha = .5
+            alpha = .5,
+            shape = 16
           ) +
           geom_vline(
             xintercept = 0,
@@ -236,7 +278,7 @@ ps <- de_long_selected %>%
             linetype = "dashed"
           ) +
           scale_color_manual(
-            values = c("not perturbed" = "gray", "up" = "#630D22", "down" = "#212A62")
+            values = c("not perturbed" = "gray", "up" = "#762a83", "down" = "#1b7837")
           ) +
           geom_text(
             aes(
@@ -249,6 +291,25 @@ ps <- de_long_selected %>%
             y = Inf,
             vjust = 1,
             inherit.aes = FALSE
+          ) +
+          geom_text_repel(
+            aes(
+              label = gene_name
+            ),
+            data = \(x) mutate(
+              x,
+              gene_name = if_else(
+                .density < quantile(.density, .002),
+                gene_name,
+                ""
+              )
+            ),
+            max.iter = 1e5,
+            max.time = 5,
+            max.overlaps = Inf,
+            size = 2,
+            seed = 42,
+            force = 5
           ) +
           labs(
             x = "log2 fold-change",
@@ -267,6 +328,15 @@ pwalk(
       p, width = 6, height = 4
     )
   }
+)
+
+x <- plotly::ggplotly(
+  ps$p[[7]]
+)
+
+htmlwidgets::saveWidget(
+  x,
+  file = "plots/volcano_PT_vs_DMSO.html"
 )
 ```
 
@@ -492,12 +562,13 @@ write_csv(
 
 
 ```{r}
-rescue_type_colors = c(
-  both = "purple",
-  `JNK-inh only` = "red",
-  `GNE-495 only` = "blue",
-  `no rescue` = "gray20",
-  `not perturbed` = "gray80"
+rd_bu_colors <- RColorBrewer::brewer.pal(5, "RdBu")
+rescue_type_colors <- c(
+  # both = "#8856a7",
+  both = "gray10",
+  `JNK-inh only` = rd_bu_colors[1],
+  `GNE-495 only` = tail(rd_bu_colors, 1),
+  `no rescue` = "gray70"
 )
 ```
 
@@ -521,7 +592,13 @@ ptx_rescue_plot_data_w_type <- ptx_rescue_plot_data %>%
       )
   )  %>%
   filter(rescue_type != "not perturbed") %>%
-  arrange(desc(rescue_type))
+  arrange(
+    if_else(
+      rescue_type == "no rescue",
+      -1,
+      withr::with_seed(42, runif(n()))
+    )
+  )
 
 p <- ggplot(
   ptx_rescue_plot_data_w_type,
@@ -572,7 +649,8 @@ p <- ggplot(
   geom_abline() +
   geom_point(
     alpha = 0.5,
-    shape = "circle small"
+    shape = "circle small",
+    size = 1
   ) +
   scale_color_manual(
     values = rescue_type_colors
@@ -590,7 +668,7 @@ p <- ggplot(
 dir.create("plots", showWarnings = FALSE)
 ggsave(
   file.path("plots", "ptx_rescue_scatter_logFC_w_rescue_type_all.pdf"),
-  p, width = 8, height = 12, device = cairo_pdf
+  p, width = 5, height = 8, device = cairo_pdf
 )
 ```
 
@@ -2575,12 +2653,7 @@ ptx_rescue_alluvial_plots <- ptx_rescue_type_list %>%
         ) +
         # ggokabeito::scale_color_okabe_ito(order = c(2, 1), guide = "none") +
         scale_fill_manual(
-          values = c(
-            both = "black",
-            `JNK-inh only` = "purple",
-            `GNE-495 only` = "green",
-            `no rescue` = "gray85"
-          )
+          values = rescue_type_colors
         ) +
         labs(x = NULL) +
         # scale_fill_manual(
