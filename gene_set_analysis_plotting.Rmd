@@ -591,6 +591,38 @@ hm <- Heatmap(
   )
 )
 
+fgsea_picked_to_highlight <- c(
+  "METABOLISM_OF_LIPIDS",
+  "METABOLISM_OF_STEROIDS",
+  "CHOLESTEROL_BIOSYNTHESIS",
+  "ACTIVATION_OF_GENE_EXPRESSION_BY_SREBF_SREBP",
+  "REGULATION_OF_CHOLESTEROL_BIOSYNTHESIS_BY_SREBP_SREBF",
+  "REGULATION_OF_EXPRESSION_OF_SLITS_AND_ROBOS",
+  "SIGNALING_BY_ROBO_RECEPTORS",
+  "FATTY_ACID_METABOLISM",
+  "FATTY_ACYL_COA_BIOSYNTHESIS",
+  "PHOSPHOLIPID_METABOLISM",
+  "GLYCEROPHOSPHOLIPID_BIOSYNTHESIS",
+  "GAP_JUNCTION_ASSEMBLY",
+  "KINESINS",
+  "GAP_JUNCTION_TRAFFICKING_AND_REGULATION",
+  "ORGANELLE_BIOGENESIS_AND_MAINTENANCE",
+  "RHO_GTPASES_ACTIVATE_IQGAPS",
+  "COPI_INDEPENDENT_GOLGI_TO_ER_RETROGRADE_TRAFFIC",
+  "RHO_GTPASES_ACTIVATE_FORMINS",
+  "HDACS_DEACETYLATE_HISTONES",
+  "COPI_DEPENDENT_GOLGI_TO_ER_RETROGRADE_TRAFFIC",
+  "GOLGI_TO_ER_RETROGRADE_TRANSPORT",
+  "INTRA_GOLGI_AND_RETROGRADE_GOLGI_TO_ER_TRAFFIC",
+  "SIGNALING_BY_RHO_GTPASES_MIRO_GTPASES_AND_RHOBTB3",
+  "TRANSPORT_TO_THE_GOLGI_AND_SUBSEQUENT_MODIFICATION",
+  "RHO_GTPASE_EFFECTORS",
+  "APOPTOSIS",
+  "ER_TO_GOLGI_ANTEROGRADE_TRANSPORT",
+  "VESICLE_MEDIATED_TRANSPORT",
+  "MEMBRANE_TRAFFICKING"
+)
+
 mat <- fgsea_res_pert_mat[as.character(fgsea_res_pert_hm_pathways), fgsea_hm_conditions]
 mat_max_abs <- max(abs(quantile(mat, c(.025, .975), na.rm = TRUE)))
 hm <- Heatmap(
@@ -613,17 +645,7 @@ hm <- Heatmap(
     which = "row"
   ),
   right_annotation = HeatmapAnnotation(
-    pathways = c(
-      "ACTIVATION_OF_GENE_EXPRESSION_BY_SREBF_SREBP",
-      "FATTY_ACID_METABOLISM",
-      "METABOLISM_OF_LIPIDS",
-      "TRNA_AMINOACYLATION",
-      "CELL_CYCLE",
-      "REGULATION_OF_EXPRESSION_OF_SLITS_AND_ROBOS",
-      "GAP_JUNCTION_TRAFFICKING_AND_REGULATION",
-      "ER_TO_GOLGI_ANTEROGRADE_TRANSPORT",
-      "COPI_MEDIATED_ANTEROGRADE_TRANSPORT"
-    ) %>%
+    pathways = fgsea_picked_to_highlight %>%
       {
         anno_mark(
           at = match(., fgsea_res_pert_hm_pathways),
@@ -646,6 +668,35 @@ withr::with_pdf(
 )
 
 InteractiveComplexHeatmap::htShiny(draw(hm), save = here("plots/reactome_pert_heatmap_k8"))
+
+hm_with_names <- Heatmap(
+  mat,
+  col = circlize::colorRamp2(seq(from = -mat_max_abs, to = mat_max_abs, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
+  name = "Normalized enrichment score",
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  left_annotation = HeatmapAnnotation(
+    df = row_clust_df %>%
+        select(pathway, cluster = k_8) %>%
+        slice(match(as.character(fgsea_res_pert_hm_pathways), pathway)) %>%
+        column_to_rownames("pathway"),
+    col = list(
+      cluster = set_names(
+        ggokabeito::palette_okabe_ito(1:8), 1:8
+      )
+    ),
+    which = "row"
+  )
+)
+
+withr::with_pdf(
+  here("plots", "reactome_pert_heatmap_k8_with_names.pdf"),
+  draw(hm_with_names),
+  width = 9, height = 16
+)
+
 ```
 
 
@@ -996,6 +1047,10 @@ de_pert_rescue_hm_data <- tibble(
     row_meta = map2(
       pathway, mat,
       \(x, y) {
+        tibble(
+          gene_id = rownames(y)
+        ) %>%
+
         fgsea_res_rescue_data %>%
           filter(pathway == x) %>%
           select(compound, gene_id = leadingEdge) %>%
@@ -1369,6 +1424,28 @@ fgsea_intersection_dotplot_data <- fgsea_intersection_overrep_data %>%
   )
 ```
 
+Check what genes are in JNK-inh rescued mitosis related pathways
+
+```{r}
+x <- fgsea_intersection_overrep_data %>%
+  arrange(p.value_fgsea) %>%
+  filter(
+    rescue_definition == "significant_opposite",
+    rescue_type == "JNK-inh only"
+  )
+
+x %>%
+  filter(
+    pathway == "METALLOPROTEASE_DUBS"
+  ) %>%
+  chuck("overlapGenes", 1) %>%
+  {gene_id_gene_symbol_map[.]}
+
+gene_id_gene_symbol_map[x$overlapGenes[[1]]]
+```
+
+
+
 ```{r}
 
 flag_similar_adjacent_leaves <- function(clust, sim_matrix, threshold) {
@@ -1453,6 +1530,7 @@ fgsea_intersection_overrep_data_single <- fgsea_intersection_overrep_data %>%
 
 fgsea_blacklist <- c(
   "HCMV EARLY EVENTS",
+  "HCMV INFECTION",
   "INFECTIOUS DISEASE"
 )
 
@@ -1519,7 +1597,7 @@ fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single
           )
         }
         sim_hm <- msigdbr_of_interest_sim_trans[
-          clust$labels[clust$order], clust$labels[clust$order]
+          rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
         ] %>%
           pheatmap(
             cluster_rows = FALSE,
@@ -1571,24 +1649,29 @@ fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single
         list(
           p = p,
           sim_hm = sim_hm
-        )
+        ) %>%
+          map(list)
       }
     )
   ) %>%
   select(-data) %>%
   unnest_wider(
-    res,
-    strict = FALSE
+    res
   )
 
 flag_similar_adjacent_leaves(clust, msigdbr_of_interest_sim_trans, .6)
 
 pwalk(
   fgsea_intersection_dotplot_data_single,
-  \(p, rescue_definition, p_threshold, ...) {
+  \(p, rescue_definition, p_threshold, sim_hm, ...) {
     ggsave(
       file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, ".pdf")),
-      p, width = 9.8, height = 9
+      p[[1]], width = 9.8, height = 9
+    )
+    withr::with_pdf(
+      file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, "_similarity.pdf")),
+      draw(sim_hm[[1]]),
+      width = 9.8, height = 9
     )
   }
 )
@@ -1752,46 +1835,60 @@ de_pert_rescue_hm_data <- tibble(
         filter(
           pathway == x
         ) %>%
-        pull(ensembl_gene) %>%
-        unique()
+        distinct(gene_symbol, ensembl_gene) %>%
+        semi_join(
+          de_pert_hm_data,
+          by = c("ensembl_gene" = "gene_id")
+        )
     ),
     mat = map(
       genes,
       \(x) de_pert_hm_data %>%
-        filter(
-          gene_id %in% x
+        semi_join(
+          x,
+          by = c("gene_id" = "ensembl_gene")
         ) %>%
-        select(gene_id, con trast, logFC) %>%
+        select(gene_id, contrast, logFC) %>%
         pivot_wider(names_from = contrast, values_from = logFC, values_fill = 0) %>%
         column_to_rownames("gene_id") %>%
         as.matrix() %>% {
-          .[, fgsea_hm_conditions]
+          .[x$ensembl_gene, fgsea_hm_conditions]
         }
     ),
     row_meta = map2(
-      pathway, mat,
+      pathway, genes,
       \(x, y) {
-        fgsea_res_rescue_data %>%
-          filter(pathway == x) %>%
-          select(compound, gene_id = leadingEdge) %>%
-          unchop(gene_id) %>%
-          mutate(
-            gene_id = factor(gene_id, levels = rownames(y)),
-            decoy = 1L
-          ) %>%
-          pivot_wider(
-            names_from = compound, values_from = decoy,
-            names_prefix = "leading_edgge_",
-            id_expand = TRUE, values_fill = 0L
-          ) %>%
-          column_to_rownames("gene_id") %>% {
-            .[rownames(y), ]
-          }
+        power_left_join(
+          y,
+          fgsea_res_rescue_data %>%
+            filter(pathway == x) %>%
+            select(compound, gene_id = leadingEdge) %>%
+            unchop(gene_id) %>%
+            mutate(decoy = 1L) %>%
+            pivot_wider(
+              names_from = compound, values_from = decoy,
+              names_prefix = "leading_edge_",
+              values_fill = 0L
+            ),
+          by = c("ensembl_gene" = "gene_id"),
+          check = check_specs(
+            unmatched_keys_right = "warn",
+            duplicate_keys_right = "warn",
+            duplicate_keys_left = "warn"
+          )
+        ) %>%
+        mutate(
+          across(
+            starts_with("leading_edge_"),
+            \(x) if_else(is.na(x), 0L, x)
+          )
+        )
       }
     ),
     hm = pmap(
-      list(pathway, mat, row_meta),
-      \(x, y, z) {
+      list(pathway, mat, row_meta, genes),
+      \(x, y, z, g) {
+        # browser()
         mat_max_abs <- max(abs(quantile(y, c(.025, .975), na.rm = TRUE)))
         Heatmap(
           y,
@@ -1799,8 +1896,12 @@ de_pert_rescue_hm_data <- tibble(
           col = circlize::colorRamp2(seq(from = -mat_max_abs, to = mat_max_abs, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
           cluster_rows = cluster_fun_eucl,
           cluster_columns = FALSE,
+          row_labels = g$gene_symbol,
           right_annotation = HeatmapAnnotation(
-            df = z,
+            df = z %>%
+              select(ensembl_gene, starts_with("leading_edge_")) %>%
+              column_to_rownames("ensembl_gene") %>%
+              as.matrix(),
             which = "row"
           )
         )

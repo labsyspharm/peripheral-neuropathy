@@ -59,6 +59,24 @@ de_long <- de_raw %>%
 ```
 
 
+
+```{r}
+raw_counts_ruvk4 <- de_raw %>%
+  select(
+    gene_id, gene_name, gene_type,
+    # only gene expression
+    matches("^S[0-9]+_[^\\._]+$")
+  ) %>%
+  pivot_longer(
+    -c(gene_id, gene_name, gene_type),
+    names_to = c("sample_id", "condition"),
+    names_pattern = "(S[0-9]+)_(.*)",
+    values_to = "count"
+  )
+
+```
+
+
 ```{r}
 dplyr::distinct(de_long, contrast)
 
@@ -125,15 +143,68 @@ write_csv(
   feasible_genes,
   "feasible_genes.csv.gz"
 )
+feasible_genes <- read_csv("feasible_genes.csv.gz")
 ```
 
 ## Transform counts
 
 ```{r}
 de_meta <- raw_counts_long %>%
-  distinct(sample_id, condition)
+  distinct(sample_id, condition) %>%
+  mutate(
+    paclitaxel = if_else(str_detect(condition, "PTX"), "PTX", "DMSO"),
+    treatment = case_when(
+      str_detect(condition, "GNE495") ~ "GNE-495",
+      str_detect(condition, "JNKinh") ~ "JNK-inh",
+      TRUE ~ "DMSO"
+    )
+  )
 
-de_all <- DESeq2::DESeqDataSetFromMatrix(
+write_csv(
+  de_meta,
+  "de_meta.csv.gz"
+)
+
+de_all_ruvk4 <- DESeq2::DESeqDataSetFromMatrix(
+  raw_counts_ruvk4 %>%
+    select(gene_id, sample_id, count) %>%
+    pivot_wider(names_from = sample_id, values_from = count) %>%
+    # S36 missing for some reason...
+    select(gene_id, any_of(de_meta$sample_id)) %>%
+    column_to_rownames("gene_id") %>%
+    as.matrix(),
+  de_meta %>%
+    filter(sample_id %in% raw_counts_ruvk4$sample_id),
+  design = ~ condition
+) %>%
+  DESeq2::estimateSizeFactors()
+```
+
+```{r}
+counts_trans_ruvk4 <- list(
+  vsn = SummarizedExperiment::assay(DESeq2::varianceStabilizingTransformation(de_all_ruvk4, blind = FALSE)),
+  rlog = SummarizedExperiment::assay(DESeq2::rlog(de_all_ruvk4, blind = FALSE)),
+  normalized = DESeq2::counts(de_all_ruvk4, normalized = TRUE),
+  raw = DESeq2::counts(de_all_ruvk4, normalized = FALSE)
+) %>%
+  map(
+    \(x) as_tibble(x, rownames = "gene_id")
+  ) %>%
+  bind_rows(.id = "transformation") %>%
+  mutate(
+    across(gene_id, \(x) str_remove(x, "\\.\\d+$"))
+  ) %>%
+  select(transformation, gene_id, everything())
+
+write_csv(
+  counts_trans_ruvk4,
+  "transformed_counts_ruvk4.csv.gz"
+)
+```
+
+
+```{r}
+de_all_ruvk4 <- DESeq2::DESeqDataSetFromMatrix(
   raw_counts_long %>%
     select(gene_id, sample_id, value) %>%
     pivot_wider(names_from = sample_id, values_from = value) %>%
@@ -238,6 +309,11 @@ compute_point_density <- function(df, x_col, y_col, ...) {
 de_long_selected %>%
   compute_point_density("logFC", "signed_padj")
 
+picked_ptx_vs_dmso_genes <- c(
+  "TUBB4B", "TUBB3", "TUBB", "TUBA1A", "TUBB2B", "KCNJ10", "KCNJ13", "CACNG3", "KCNK4", "CASP3",
+  "ACAT2", "ASS1", "IDH1", "LSS", "ACSS2", "SUCNR1", "ASCL4"
+)
+
 ps <- de_long_selected %>%
   group_nest(contrast) %>%
   mutate(
@@ -251,8 +327,31 @@ ps <- de_long_selected %>%
           filter(is.finite(nlog10_FDR)) %>%
           compute_point_density("logFC", "nlog10_FDR", n = 100)
 
+        # Use manually selected genes for PTX
+        if (contrast == "PTX") {
+          p_data <- p_data %>%
+            mutate(
+              gene_name_repel = if_else(
+                # .density < quantile(.density, .002) |
+                gene_name %in% picked_ptx_vs_dmso_genes,
+                gene_name,
+                ""
+              )
+            )
+        } else {
+          p_data <- p_data %>%
+            mutate(
+              gene_name_repel = if_else(
+                .density < quantile(.density, .002),
+                gene_name,
+                ""
+              )
+            )
+        }
+
         ggplot(
           p_data %>%
+            filter(gene_type == "protein_coding") %>%
             arrange(
               match(perturbed, c("not perturbed", "down", "up"))
             ),
@@ -262,11 +361,11 @@ ps <- de_long_selected %>%
             text = gene_name
           )
         ) +
-          geom_point(
+          ggrastr::rasterize(geom_point(
             aes(color = perturbed),
             alpha = .5,
             shape = 16
-          ) +
+          ), dpi = 300, dev = "ragg") +
           geom_vline(
             xintercept = 0,
             color = "gray",
@@ -292,25 +391,29 @@ ps <- de_long_selected %>%
             vjust = 1,
             inherit.aes = FALSE
           ) +
+          # ggnewscale::new_scale_color() +
           geom_text_repel(
+            # if (contrast == "PTX")
+            #   aes(
+            #     label = gene_name_repel,
+            #     color = gene_name %in% picked_ptx_vs_dmso_genes
+            #   )
+            # else
             aes(
-              label = gene_name
-            ),
-            data = \(x) mutate(
-              x,
-              gene_name = if_else(
-                .density < quantile(.density, .002),
-                gene_name,
-                ""
-              )
+              label = gene_name_repel
             ),
             max.iter = 1e5,
             max.time = 5,
             max.overlaps = Inf,
             size = 2,
             seed = 42,
-            force = 5
+            force = 5,
+            min.segment.length = 0
           ) +
+          # scale_color_manual(
+          #   values = c(`TRUE` = "red", `FALSE` = "black"),
+          #   guide = "none"
+          # ) +
           labs(
             x = "log2 fold-change",
             y = "-log10(adjusted p-value)",
@@ -324,7 +427,7 @@ pwalk(
   ps,
   \(contrast, p, ...) {
     ggsave(
-      file.path("plots", paste0("volcano_", contrast, ".pdf")),
+      file.path("plots", paste0("volcano_", contrast, "_raster.pdf")),
       p, width = 6, height = 4
     )
   }
@@ -336,7 +439,8 @@ x <- plotly::ggplotly(
 
 htmlwidgets::saveWidget(
   x,
-  file = "plots/volcano_PT_vs_DMSO.html"
+  file = "plots/volcano_PT_vs_DMSO.html",
+  selfcontained = FALSE
 )
 ```
 
@@ -1309,6 +1413,101 @@ qsave(
 
 ```
 
+### TopGO on rescue intersection
+
+
+```{r}
+feasible_gene_vec <- feasible_genes %>%
+  filter(feasible) %>%
+  pull(gene_id)
+
+topgo_ptx_rescue_type_list <- ptx_rescue_type_list %>%
+  group_by(
+    perturbed, rescue_definition, rescue_type
+  ) %>%
+  summarize(
+    gene_vec = list(
+      set_names(
+        # factor(as.integer(feasible_gene_vec %in% gene_id)),
+        if_else(feasible_gene_vec %in% gene_id, .01, 1),
+        feasible_gene_vec
+      )
+    ),
+    .groups = "drop"
+  )
+
+
+topgo_ptx_rescue_type_list_raw <- topgo_ptx_rescue_type_list %>%
+  crossing(
+    ontology = names(topgo_objects)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    res = {
+      go <- updateGenes(
+        topgo_objects[[ontology]],
+        geneList = gene_vec,
+        geneSelFun = gene_sel_fun
+      )
+      # browser()
+      raw <- runTest(
+        go,
+        algorithm = "weight01",
+        statistic = "fisher"
+      )
+      res_table <- GenTable(
+        go,
+        fisher = raw,
+        topNodes = length(usedGO(go)),
+        numChar = 300
+      )
+      list(
+        res_raw = raw,
+        res = res_table
+      ) %>%
+        list()
+    }
+  ) %>%
+  ungroup()
+
+qsave(
+  topgo_ptx_rescue_type_list_raw,
+  "topgo_ptx_rescue_type_list_raw.qs"
+)
+topgo_ptx_rescue_type_list_raw <- qread("topgo_ptx_rescue_type_list_raw.qs")
+
+topgo_ptx_rescue_type_list_res <- topgo_ptx_rescue_type_list_raw %>%
+  rowwise() %>%
+  mutate(
+    res_table = list(res[["res"]])
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-c(res, gene_vec)) %>%
+  unnest(res_table) %>%
+  mutate(
+    term_unique = paste(
+      Term, GO.ID, sep = "_"
+    ),
+    fisher_double = as.double(str_remove(fisher, fixed("< ")))
+  )
+
+write_csv(
+  topgo_ptx_rescue_type_list_res,
+  "topgo_ptx_rescue_type_list_res.csv.gz"
+)
+topgo_ptx_rescue_type_list_res <- read_csv("topgo_ptx_rescue_type_list_res.csv.gz")
+
+topgo_ptx_rescue_type_list_res %>%
+  filter(
+    fisher_double < .05,
+    rescue_definition == "significant_opposite",
+    rescue_type == "GNE-495 only"
+  ) %>%
+  arrange(fisher_double) %>%
+  View()
+```
+
+
 ## FGSEA overrepresentation
 
 ### FGSEA overrepresentation on rescue gene sets
@@ -1449,8 +1648,6 @@ qsave(
   ptx_rescue_intersections_overrepresentation,
   "ptx_rescue_intersections_overrepresentation.qs"
 )
-
-
 ```
 
 ```{r}
@@ -3145,6 +3342,9 @@ synStoreMany(
     "ptx_rescue_list_long.csv.gz",
     "ptx_rescue_type_list.csv.gz",
     "indra_res.csv.gz",
+    "topgo_ptx_rescue_type_list_res.csv.gz",
+    "de_meta.csv.gz",
+    "transformed_counts_ruvk4.csv.gz",
     file.path(
       "results",
       c(

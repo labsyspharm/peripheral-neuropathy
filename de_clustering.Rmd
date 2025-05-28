@@ -30,8 +30,13 @@ rescue_list <- syn("syn64608137") %>%
 
 rescue_type_list <- syn("syn64608138") %>%
   read_csv()
-```
 
+counts_trans_ruvk4 <- syn("syn66638335") %>%
+  read_csv()
+
+de_meta <- syn("syn66637916") %>%
+  read_csv()
+```
 
 
 
@@ -165,5 +170,163 @@ withr::with_pdf(
   file.path("plots", "de_heatmaps", "all_de_genes.pdf"),
   draw(hm),
   width = 7, height = 15
+)
+```
+
+
+## PCA
+
+
+```{r}
+rlog_mat <- counts_trans_ruvk4 %>%
+  filter(
+    transformation == "rlog"
+  ) %>%
+  select(-transformation) %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+
+pca_raw <- prcomp(
+  t(rlog_mat),
+  center = TRUE,
+  scale = FALSE
+)
+
+pca_eigen <- broom::tidy(
+  pca_raw, matrix = "eigenvalues"
+)
+
+pca_eigen_map <- with(
+  pca_eigen,
+  set_names(
+    signif(percent * 100, 2),
+    paste0("PC", seq_along(PC))
+  )
+)
+
+pca_x <- pca_raw$x %>%
+  as_tibble(rownames = "sample_id") %>%
+  left_join(
+    de_meta,
+    by = "sample_id"
+  )
+
+pca_x_long <- pca_x %>%
+  select(sample_id, starts_with("PC")) %>%
+  pivot_longer(
+    starts_with("PC"),
+    names_to = "PC",
+    values_to = "value"
+  )
+```
+
+
+```{r}
+pca_x_vs <- combn(1:4, 2) %>%
+  t() %>%
+  magrittr::set_colnames(c("component_1", "component_2")) %>%
+  as_tibble() %>%
+  mutate(
+    across(
+      everything(),
+      \(x) paste0("PC", x)
+    )
+  ) %>%
+  left_join(
+    pca_x_long,
+    by = c("component_1" = "PC")
+  ) %>%
+  left_join(
+    pca_x_long,
+    by = c("component_2" = "PC", "sample_id"),
+    suffix = c("_1", "_2")
+  ) %>%
+  left_join(
+    de_meta,
+    by = "sample_id"
+  )
+```
+
+
+```{r}
+
+rd_bu_colors <- RColorBrewer::brewer.pal(5, "RdBu")
+treatment_colors <- c(
+  `JNK-inh` = rd_bu_colors[1],
+  `GNE-495` = tail(rd_bu_colors, 1),
+  `DMSO` = "gray70"
+)
+
+p <- ggplot(
+  pca_x_vs,
+  aes(
+    x = value_1,
+    y = value_2,
+    shape = paclitaxel,
+    color = treatment
+  )
+) +
+  geom_point() +
+  scale_color_manual(
+    values = treatment_colors,
+    name = "Treatment"
+  ) +
+  scale_shape_discrete(
+    name = "Paclitaxel"
+  ) +
+  facet_grid(
+    rows = vars(component_2),
+    cols = vars(component_1)
+  ) +
+  theme_bw()
+
+ps <- pca_x_vs %>%
+  group_nest(
+    component_1,
+    component_2
+  ) %>%
+  mutate(
+    across(
+      starts_with("component"),
+      \(x) fct_relabel(x, \(y) paste0(y, " (", as.character(pca_eigen_map[y]), "%)"))
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      ggplot(
+        data,
+        aes(
+          x = value_1,
+          y = value_2,
+          shape = paclitaxel,
+          color = treatment
+        )
+      ) +
+        geom_point() +
+        scale_color_manual(
+          values = treatment_colors,
+          name = "Rescue treatment"
+        ) +
+        scale_shape_discrete(
+          name = "Paclitaxel"
+        ) +
+        labs(
+          x = component_1,
+          y = component_2
+        )
+    )
+  )
+
+ps_combined <- egg::ggarrange(
+  plots = ps$p
+)
+
+ggsave(
+  file.path("plots", "pca_ruvk4_combined_1-4.pdf"),
+  ps_combined,
+  width = 10,
+  height = 8
 )
 ```
