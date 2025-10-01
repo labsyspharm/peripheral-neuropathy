@@ -1,0 +1,11 @@
+{
+    "input": "2025-09-29_paclitaxel_rescue.csv",
+    "outdir": "output",
+    "fasta": "\/home\/ch305\/annotation\/hsap\/GRCh38.114\/Homo_sapiens.GRCh38.dna_sm.primary_assembly.fa.gz",
+    "gtf": "\/home\/ch305\/annotation\/hsap\/GRCh38.114\/Homo_sapiens.GRCh38.114.gtf.gz",
+    "pseudo_aligner": "salmon",
+    "save_reference": true,
+    "save_align_intermeds": true,
+    "skip_markduplicates": true,
+    "skip_bigwig": true
+}

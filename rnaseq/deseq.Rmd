@@ -1,0 +1,358 @@
+---
+title: "Deseq analysis of paclitaxel rescue RNA-seq"
+author: "Clemens Hug"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+library(DESeq2)
+library(conflicted)
+library(readxl)
+library(tximport)
+library(emmeans)
+library(ComplexHeatmap)
+
+conflicts_prefer(base::setdiff)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+```{r}
+raw_counts <- syn("syn69961549") %>%
+  read_rds()
+
+meta_raw <- syn("syn69962755") %>%
+  read_excel() %>%
+  mutate(
+    ptx = factor(if_else(str_detect(condition, coll("PTX")), "yes", "no")),
+    gne_495 = factor(if_else(str_detect(condition, coll("GNE")), "yes", "no")),
+    jnk_in = factor(if_else(str_detect(condition, coll("JNK")), "yes", "no"))
+  )
+
+meta_batch2 <- meta_raw %>%
+  filter(
+    experiment == 2
+  ) %>%
+  mutate(
+    salmon_syn = map_chr(
+      sample_id_sequencing,
+      \(x) synPluck("syn69961369", paste0(x, ".tar.gz"))
+    ),
+    salmon_tar = map_chr(salmon_syn, syn)
+  )
+
+tx2gene <- syn("syn69961460") %>%
+  read_tsv()
+
+raw_salmon_batch2 <- meta_batch2 %>%
+  mutate(
+    quant_path = map2_chr(
+      salmon_tar, sample_id_sequencing,
+      \(x, y) {
+        out_dir <- file.path(tempdir(), y)
+        untar(x, files = "quant.sf", exdir = out_dir)
+        file.path(out_dir, "quant.sf")
+      }
+    )
+  ) %>%
+  with(
+    tximport(
+      set_names(quant_path, sample_id_sequencing),
+      type = "salmon",
+      txIn = TRUE, txOut = FALSE,
+      tx2gene = select(tx2gene, transcript_id, gene_id)
+    )
+  )
+
+```
+
+```{r}
+de_batch2 <- DESeqDataSetFromTximport(
+  raw_salmon_batch2,
+  meta_batch2,
+  design = ~ ptx*gne_495*jnk_in*batch
+) %>%
+  DESeq()
+
+de_batch2_reduced <- DESeq(
+    de_batch2,
+    reduced = ~ ptx*gne_495*jnk_in + batch,
+    test = "LRT"
+  )
+
+```
+
+
+```{r}
+batch2_counts <- list(
+  raw = counts(de_batch2, normalized = FALSE),
+  normalized = counts(de_batch2, normalized = TRUE),
+  vst = vst(de_batch2) %>%
+    assay()
+) %>%
+  map(
+    \(x) as_tibble(x, rownames = "gene_id")
+  ) %>%
+  bind_rows(.id = "type")
+```
+
+
+```{r}
+pca_batch2 <- batch2_counts %>%
+  filter(type == "vst") %>%
+  select(-type) %>%
+  column_to_rownames("gene_id") %>%
+  t() %>%
+  prcomp(center = TRUE, scale = FALSE)
+
+pca_x <- pca_batch2$x %>%
+  as_tibble(rownames = "sample_id_sequencing") %>%
+  power_inner_join(
+    meta_batch2,
+    by = "sample_id_sequencing",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+pca_sd <- broom::tidy(pca_batch2, "eigenvalues")
+```
+
+```{r}
+p <- ggplot(
+  pca_x %>%
+    mutate(
+      rescue = case_when(
+        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
+        gne_495 == "yes" ~ "GNE-495",
+        jnk_in == "yes" ~ "JNK-inh",
+        TRUE ~ "none"
+      )
+    ),
+  aes(
+    x = PC1, y = PC2,
+    color = ptx,
+    fill = rescue,
+    shape = batch
+  )
+) +
+  geom_point(
+    alpha = .7
+  ) +
+  scale_shape_manual(
+    values = c(21, 24)
+  ) +
+  scale_color_manual(
+    values = c(
+      "no" = "grey70",
+      "yes" = "black"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "none" = "grey70",
+      "GNE-495" = "red",
+      "JNK-inh" = "blue",
+      "GNE-495 + JNK-inh" = "purple"
+    )
+  ) +
+  guides(
+    fill = guide_legend(override.aes = list(shape = 21, color = NA))
+  )
+p
+
+dir.create(here("rnaseq", "plots"), showWarnings = FALSE)
+ggsave(
+  here("rnaseq", "plots", "pca_batch2_vst_pc1_pc1.pdf"),
+  p, width = 6, height = 4
+)
+```
+
+
+```{r}
+lrt_res <- results(de_batch2_reduced, tidy = TRUE) %>%
+  as_tibble()
+
+resultsNames(de_batch2)
+
+extract_deseq_result <- function(de, contrast, name, res_args = list(), shrink_args = list()) {
+  if (missing(contrast)) {
+    res <- rlang::exec(results, de, name = name, !!!res_args)
+  } else {
+    res <- rlang::exec(results, de, contrast = contrast, !!!res_args)
+  }
+  if (!"type" %in% names(shrink_args)) {
+    shrink_args$type <- "ashr"
+  }
+  shrunken <- rlang::exec(lfcShrink, de, res = res, !!!shrink_args)
+  shrunken %>%
+    as_tibble(rownames = "gene_id") %>%
+    left_join(
+      res %>%
+        as_tibble(rownames = "gene_id") %>%
+        select(gene_id, log2FoldChange, lfcSE),
+      by = "gene_id", suffix = c("", "_MLE")
+    )
+}
+
+res_long <- resultsNames(de_batch2) %>%
+  setdiff("Intercept") %>%
+  set_names() %>%
+  map(
+    \(x) extract_deseq_result(de_batch2, name = x)
+  ) %>%
+  bind_rows(.id = "term")
+```
+
+
+
+```{r}
+single_gene_data <- meta_batch2 %>%
+  mutate(
+    expression = raw_salmon_batch2$counts["ENSG00000109084", ] %>%
+      log10()
+  )
+
+mdl <- lm(
+  expression ~ ptx*gne_495*jnk_in*batch,
+  data = single_gene_data
+)
+
+desired_contrasts <- contrast_map <- tribble(
+  ~name, ~numerator, ~denominator,
+  "GNE-495", "no yes no", "no no no",
+  "JNK-inh", "no no yes", "no no no",
+  "GNE-495 + PTX", "yes yes no", "no no no",
+  "JNK-inh + PTX", "yes no yes", "no no no",
+  "PTX", "yes no no", "no no no",
+  "GNE-495 + PTX vs PTX", "yes yes no", "yes no no",
+  "JNK-inh + PTX vs PTX", "yes no yes", "yes no no",
+  "GNE-495 + JNK-inh + PTX vs PTX", "yes yes yes", "yes no no",
+  "GNE-495 + JNK-inh", "no yes yes", "no no no",
+  "GNE-495 + JNK-inh + PTX vs JNK-inh + PTX", "yes yes yes", "yes no yes",
+  "GNE-495 + JNK-inh + PTX vs GNE-495 + PTX", "yes yes yes", "yes yes no"
+)
+
+library(emmeans)
+mdl_emm <- emmeans(
+  mdl, ~ptx+gne_495+jnk_in
+) %>%
+  contrast(
+    method = "revpairwise"
+  )
+
+res_emm <- list(
+  mdl_emm
+) %>%
+  map(
+    \(x) x@grid  %>%
+      as_tibble() %>%
+      mutate(
+        contrast_vec = asplit(x@linfct, 1)
+      )
+  ) %>%
+  bind_rows() %>%
+  mutate(
+    res = map(
+      contrast_vec,
+      \(x) {
+        contrast_de <- set_names(
+          x[colnames(model.matrix(mdl))],
+          resultsNames(de_batch2)
+        )
+        extract_deseq_result(
+          de_batch2,
+          contrast = contrast_de
+        )
+      }
+    )
+  )
+
+res_emm_long <- desired_contrasts %>%
+  mutate(
+    contrast = paste(numerator, "-", denominator)
+  ) %>%
+  power_inner_join(
+    res_emm,
+    by = "contrast",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn"
+    )
+  ) %>%
+  select(-c(numerator, denominator, contrast, contrast_vec)) %>%
+  unnest(res) %>%
+  power_inner_join(
+    distinct(tx2gene, gene_id, gene_name),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  res_emm_long,
+  here("rnaseq", "batch2_deseq2_emm_results.csv.gz")
+)
+```
+
+### Heatmap LFC
+
+```{r}
+res_emm_hm_data <- res_emm_long %>%
+  semi_join(
+    filter(., padj < .001),
+    by = "gene_id"
+  ) %>%
+  replace_na(list(padj = 1)) %>%
+  mutate(
+    padj = if_else(padj == 0, .5 * min(padj[padj > 0], na.rm = TRUE), padj),
+    signed_p = -log10(padj) * sign(log2FoldChange_MLE)
+  ) %>%
+  select(
+    name, gene_id, signed_p
+  ) %>%
+  pivot_wider(
+    names_from = name,
+    values_from = signed_p,
+    values_fill = 0
+  )
+
+res_emm_hm_mat <- res_emm_hm_data %>%
+  column_to_rownames("gene_id") %>%
+  as.matrix()
+
+hm <- Heatmap(
+  res_emm_hm_mat,
+  name = "signed -log10(p)",
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = TRUE,
+  col = circlize::colorRamp2(
+    quantile(res_emm_hm_mat, c(0.05, 0.95), na.rm = TRUE) %>%
+      abs() %>%
+      max() %>% {
+        .*c(-1, 0, 1)
+      },
+    c("blue", "white", "red")
+  )
+)
+
+hm
+```
+
