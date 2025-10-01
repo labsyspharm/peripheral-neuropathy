@@ -2520,3 +2520,89 @@ pwalk(
 )
 
 ```
+
+
+## Check if p38 target TFs are differentially expressed
+
+```{r}
+atf6_targets <- clipr::read_clip()
+
+de_pert_hm_data_atf6 <- de_pert_hm_data %>%
+  filter(
+    gene_name %in% atf6_targets,
+    gene_id %in% {
+      de_pert_hm_data %>%
+        filter(
+          FDR < .05
+        ) %>%
+        pull(gene_id)
+    }
+  )
+
+de_pert_hm_data_atf6_mat <- de_pert_hm_data_atf6 %>%
+    dplyr::select(
+      gene_id, contrast, logFC
+    ) %>%
+    pivot_wider(names_from = contrast, values_from = logFC, values_fill = 0) %>%
+    column_to_rownames("gene_id") %>%
+    as.matrix() %>%
+    t() %>%
+    scale() %>%
+    t() %>% {
+      .[, fgsea_hm_conditions]
+    }
+
+hm <- Heatmap(
+  de_pert_hm_data_atf6_mat,
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = TRUE
+)
+
+
+pca_fun <- function(mat, meta) {
+  pca <- prcomp(t(mat), center = TRUE, scale = FALSE)
+  pca_x <- as_tibble(pca$x) %>%
+    bind_cols(
+      meta
+    )
+  list(
+    x = pca_x,
+    sd = broom::tidy(pca, matrix = "eigenvalues"),
+    rotation = broom::tidy(pca, matrix = "rotation")
+  )
+}
+de_pert_hm_data_atf6_pca <- pca_fun(
+  de_pert_hm_data_atf6_mat,
+  tibble(contrast = fgsea_hm_conditions)
+)
+
+p <- ggplot(
+  de_pert_hm_data_atf6_pca$x,
+  aes(
+    x = PC1, y = PC3, color = contrast
+  )
+) +
+  geom_point() +
+  labs(
+    x = paste0("PC1 (", round(de_pert_hm_data_atf6_pca$sd$percent[1] * 100, 2), "%)"),
+    y = paste0("PC3 (", round(de_pert_hm_data_atf6_pca$sd$percent[3] * 100, 2), "%)")
+  ) +
+  theme_minimal()
+
+hm <- Heatmap(
+  de_pert_hm_data_atf6_pca$x %>%
+    column_to_rownames("contrast") %>%
+    # scale() %>%
+    t(),
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = FALSE,
+  show_row_names = TRUE
+)
+hm
+```
+
+
+VX-702
+DORAMAPIMOD
+LOSMAPIMOD
