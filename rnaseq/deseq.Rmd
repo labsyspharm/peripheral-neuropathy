@@ -75,6 +75,14 @@ raw_salmon_batch2 <- meta_batch2 %>%
     )
   )
 
+feasible_genes_batch2 <- {raw_salmon_batch2$counts > 5} %>%
+  rowSums() %>%
+  { names(.)[. > 3] }
+
+write_lines(
+  feasible_genes_batch2,
+  here("rnaseq", "feasible_genes_batch2.txt.gz")
+)
 ```
 
 ```{r}
@@ -356,3 +364,14 @@ hm <- Heatmap(
 hm
 ```
 
+```{r}
+synStoreMany(
+  c(
+    here("rnaseq", "batch2_deseq2_emm_results.csv.gz"),
+    here("rnaseq", "feasible_genes_batch2.txt.gz")
+  ),
+  parentId = "syn69968963",
+  forceVersion = FALSE,
+  used = meta_batch2$salmon_syn
+)
+```
