@@ -56,6 +56,17 @@ de_long <- de_raw %>%
   #   -c(gene_id, gene_name, gene_type, Description, chromosome, strand),
   #   delim = regex("(?<=^[^_]*)_")
   # )
+
+de_long_batch2 <- syn("syn69968964") %>%
+  read_csv() %>%
+  replace_na(list(padj = 1)) %>%
+  mutate(
+    padj_min_zero = if_else(padj == 0, min(padj[padj > 0], na.rm = TRUE) * .5, padj),
+    signed_padj = -sign(log2FoldChange) * log10(padj_min_zero)
+  )
+
+feasible_genes_batch2 <- syn("syn70094663") %>%
+  read_csv()
 ```
 
 
@@ -102,9 +113,68 @@ de_long_selected <- de_long %>%
     )
   )
 
+de_batch2_selected <- de_long_batch2 %>%
+  filter(
+    name %in% contrast_map
+  ) %>%
+  transmute(
+    contrast = name,
+    gene_id, gene_name,
+    logFC = log2FoldChange,
+    PValue = pvalue,
+    FDR = padj,
+    FDR_min_zero = padj_min_zero,
+    signed_padj,
+    perturbed = case_when(
+      FDR > .05 ~ "not perturbed",
+      logFC > 0 ~ "up",
+      logFC < 0 ~ "down",
+      TRUE ~ NA_character_
+    )
+  )
+
+de_long_selected_both <- bind_rows(
+  batch1 = de_long_selected,
+  batch2 = de_batch2_selected,
+  .id = "batch"
+)
+
 write_csv(
-  de_long_selected,
-  "de_long_selected.csv.gz"
+  de_long_selected_both,
+  "de_long_selected_both.csv.gz"
+)
+```
+
+
+## Plotting batch 1 vs 2
+
+```{r}
+de_long_selected_vs <- de_long_selected_both %>%
+  select(batch, gene_id, gene_name, contrast, logFC, FDR, signed_padj) %>%
+  pivot_wider(
+    names_from = batch,
+    values_from = c(logFC, FDR, signed_padj),
+    names_sep = "_"
+  )
+
+p <- ggplot(
+  de_long_selected_vs,
+  aes(
+    x = signed_padj_batch1,
+    y = signed_padj_batch2
+  )
+) +
+  geom_point(
+    alpha = .7,
+    shape = 16
+  ) +
+  facet_wrap(
+    ~contrast, scales = "free"
+  )
+p
+ggsave(
+  file.path("plots", "batch1_vs_batch2_signed_padj_scatter.pdf"),
+  p, width = 7, height = 8, device = cairo_pdf
 )
 ```
 
@@ -132,12 +202,18 @@ raw_counts_long <- raw_counts %>%
 gene_id_gene_symbol_map <- raw_counts_long %>%
   distinct(gene_id, gene_name)
 
-feasible_genes <- raw_counts_long %>%
+feasible_genes_batch1 <- raw_counts_long %>%
   group_by(gene_id) %>%
   summarize(
     feasible = sum(value > 5) > 3,
     .groups = "drop"
   )
+
+feasible_genes <- bind_rows(
+  batch1 = feasible_genes_batch1,
+  batch2 = feasible_genes_batch2,
+  .id = "batch"
+)
 
 write_csv(
   feasible_genes,
@@ -463,17 +539,17 @@ ptx_rescue_plot_data <- tribble(
   "PTX", "JNK-inh + PTX"
 ) %>%
   power_inner_join(
-    de_long_selected %>%
-      select(gene_id, logFC, PValue, FDR, FDR_min_zero, signed_padj, contrast),
+    de_long_selected_both %>%
+      select(batch, gene_id, logFC, PValue, FDR, FDR_min_zero, signed_padj, contrast),
     by = c("contrast_1" = "contrast"),
     check = check_specs(
       unmatched_keys_left = "warn"
     )
   ) %>%
   power_inner_join(
-    de_long_selected %>%
-      select(gene_id, logFC, PValue, FDR, FDR_min_zero, signed_padj, contrast),
-    by = c("contrast_2" = "contrast", "gene_id"),
+    de_long_selected_both %>%
+      select(batch, gene_id, logFC, PValue, FDR, FDR_min_zero, signed_padj, contrast),
+    by = c("contrast_2" = "contrast", "gene_id", "batch"),
     suffix = c("_1", "_2"),
     check = check_specs(
       unmatched_keys_left = "warn",
@@ -525,7 +601,7 @@ p <- ggplot(
     guide = "none"
   ) +
   ggh4x::facet_wrap2(
-    ~contrast_2,
+    ~contrast_2 + batch,
     scales = "free", axes = "all"
   ) +
   labs(
@@ -536,7 +612,7 @@ p <- ggplot(
 dir.create("plots", showWarnings = FALSE)
 ggsave(
   file.path("plots", "ptx_rescue_scatter.pdf"),
-  p, width = 7, height = 4, device = cairo_pdf
+  p, width = 7, height = 7, device = cairo_pdf
 )
 
 
@@ -553,7 +629,7 @@ p <- ggplot(
     shape = "circle small"
   ) +
   ggh4x::facet_wrap2(
-    ~contrast_2,
+    ~contrast_2 + batch,
     scales = "free", axes = "all"
   ) +
   labs(
@@ -580,10 +656,10 @@ lest 1 logs in GNE-495 + PTX or JNK-inh + PTX
 Here `x + PTX` is `x + PTX vs DMSO`, bare values are `PTX vs DMSO`
 
 ```{r}
-ptx_rescue_by_compound <- de_long_selected %>%
+ptx_rescue_by_compound <- de_long_selected_both %>%
   filter(contrast == "PTX") %>%
   power_inner_join(
-    de_long_selected %>%
+    de_long_selected_both %>%
       filter(
         str_detect(contrast, fixed("+ PTX"))
       ) %>%
@@ -592,7 +668,7 @@ ptx_rescue_by_compound <- de_long_selected %>%
         patterns = c(compound = "(?:GNE-495|JNK-inh)", " ", contrast = ".*")
       ) %>%
       select(
-        gene_id, compound, contrast,
+        batch, gene_id, compound, contrast,
         logFC, PValue, FDR, perturbed, signed_padj
       ) %>%
       pivot_wider(
@@ -600,7 +676,7 @@ ptx_rescue_by_compound <- de_long_selected %>%
         values_from = c(logFC, PValue, FDR, perturbed, signed_padj),
         names_sep = " "
       ),
-    by = "gene_id"
+    by = c("batch", "gene_id")
   )
 
 ptx_rescue_list <- ptx_rescue_by_compound %>%
@@ -626,7 +702,7 @@ ptx_rescue_list <- ptx_rescue_by_compound %>%
 
 ptx_rescue_list_neat <- ptx_rescue_list %>%
   select(
-    gene_id, compound, perturbed,
+    batch, gene_id, compound, perturbed,
     starts_with("rescue")
   )
 
@@ -680,7 +756,7 @@ rescue_type_colors <- c(
 ptx_rescue_plot_data_w_type <- ptx_rescue_plot_data %>%
   left_join(
     ptx_rescue_type_list,
-    by = "gene_id",
+    by = c("batch", "gene_id"),
     relationship = "many-to-many"
   ) %>%
   mutate(
@@ -725,7 +801,7 @@ p <- ggplot(
     values = rescue_type_colors
   ) +
   ggh4x::facet_grid2(
-    rescue_definition ~ contrast_2,
+    rescue_definition + batch ~ contrast_2,
     scales = "free", axes = "all"
   ) +
   labs(
@@ -737,7 +813,7 @@ p <- ggplot(
 dir.create("plots", showWarnings = FALSE)
 ggsave(
   file.path("plots", "ptx_rescue_scatter_w_rescue_type_all.pdf"),
-  p, width = 8, height = 8, device = cairo_pdf
+  p, width = 8, height = 15, device = cairo_pdf
 )
 
 
@@ -760,7 +836,7 @@ p <- ggplot(
     values = rescue_type_colors
   ) +
   facet_grid(
-    rescue_definition ~ contrast_2
+    rescue_definition + batch ~ contrast_2
   ) +
   coord_equal() +
   labs(
@@ -772,7 +848,7 @@ p <- ggplot(
 dir.create("plots", showWarnings = FALSE)
 ggsave(
   file.path("plots", "ptx_rescue_scatter_logFC_w_rescue_type_all.pdf"),
-  p, width = 5, height = 8, device = cairo_pdf
+  p, width = 5, height = 15, device = cairo_pdf
 )
 ```
 
@@ -784,11 +860,12 @@ all_msigdbr <- msigdbr()
 
 msigdbr_of_interest <- all_msigdbr %>%
   filter(
-    gs_cat == "H" |
-    gs_subcat %in% c(
+    gs_collection == "H" |
+    gs_subcollection %in% c(
       "CP:PID",
       "CP:KEGG",
-      "CP:REACTOME"
+      "CP:REACTOME",
+      "CP:KEGG_MEDICUS"
       # "GO:BP",
       # "GO:MF"
     )
@@ -826,10 +903,15 @@ Options
 ```{r}
 library(fgsea)
 
+feasible_gene_vec <- with(
+  filter(feasible_genes, feasible),
+  split(gene_id, batch)
+)
+
 fgsea_rescue_vectors <- ptx_rescue_by_compound %>%
-  filter(
-    perturbed != "not perturbed",
-    gene_id %in% feasible_genes$gene_id
+  semi_join(
+    filter(feasible_genes, feasible),
+    by = c("batch", "gene_id")
   ) %>%
   mutate(
     signed_padj_rescue_raw = if_else(
@@ -858,13 +940,14 @@ fgsea_rescue_vectors <- ptx_rescue_by_compound %>%
 
 fgsea_rescue_vectors_long <- fgsea_rescue_vectors %>%
   dplyr::select(
+    batch,
     gene_id,
     compound,
     contains("rescue"),
     ends_with("raw")
   ) %>%
   pivot_longer(
-    -c(gene_id, compound),
+    -c(batch, gene_id, compound),
     names_to = "metric",
     values_to = "value"
   )
@@ -883,13 +966,14 @@ p <- fgsea_rescue_vectors %>%
       y = signed_padj_rescue_clamped
     )
   ) +
-  geom_point()
+  geom_point() +
+  facet_wrap(~batch)
 p
 ```
 
 ```{r}
 fgsea_rescue_vectors_grouped <- fgsea_rescue_vectors_long %>%
-  group_by(metric, compound) %>%
+  group_by(batch, metric, compound) %>%
   summarize(
     gene_stats = set_names(
       value, gene_id
@@ -941,20 +1025,21 @@ plotEnrichment(
 ### FGSEA on raw perturbations
 
 ```{r}
-fgsea_pert_input <- de_long_selected %>%
-  filter(
-    gene_id %in% feasible_genes$gene_id
+fgsea_pert_input <- de_long_selected_both %>%
+  semi_join(
+    filter(feasible_genes, feasible),
+    by = c("batch", "gene_id")
   ) %>%
   select(
-    gene_id, contrast, signed_padj, logFC
+    batch, gene_id, contrast, signed_padj, logFC
   ) %>%
   pivot_longer(
-    -c(gene_id, contrast),
+    -c(batch, gene_id, contrast),
     names_to = "metric",
     values_to = "value"
   ) %>%
   group_by(
-    contrast, metric,
+    batch, contrast, metric,
   ) %>%
   summarize(
     gene_stats = set_names(
@@ -1105,18 +1190,18 @@ ptx_rescue_gene_sets <- ptx_rescue_by_compound %>%
 ptx_rescue_gene_sets_short <- bind_rows(
   ptx_rescue_gene_sets %>%
     dplyr::select(
-      gene_id, compound, perturbed, return_baseline, significant_opposite, overshot
+      batch, gene_id, compound, perturbed, return_baseline, significant_opposite, overshot
     ) %>%
     filter(perturbed != "not perturbed") %>%
     pivot_longer(
-      -c(gene_id, compound, perturbed),
+      -c(batch, gene_id, compound, perturbed),
       names_to = "rescue_definition",
       values_to = "rescue"
     ) %>%
     filter(rescue == "yes"),
   ptx_rescue_gene_sets %>%
     distinct(
-      gene_id, perturbed,
+      batch, gene_id, perturbed,
       rescue_definition = "perturbed",
       rescue = if_else(
         perturbed == "not perturbed",
@@ -1130,7 +1215,7 @@ ptx_rescue_gene_sets_short <- bind_rows(
 
 ptx_rescue_gene_sets %>%
   dplyr::count(
-    compound, perturbed,
+    batch, compound, perturbed,
     return_baseline, significant_opposite, overshot
   ) %>%
   View()
@@ -1138,6 +1223,7 @@ ptx_rescue_gene_sets %>%
 
 
 ```{r}
+### Have to fix the `complete()` statement below to include all genes in
 ptx_rescue_2_plot_data <- ptx_rescue_plot_data %>%
   mutate(
     across(
@@ -1145,8 +1231,8 @@ ptx_rescue_2_plot_data <- ptx_rescue_plot_data %>%
     )
   ) %>%
   semi_join(
-    feasible_genes,
-    by = "gene_id"
+    filter(feasible_genes, feasible),
+    by = c("batch", "gene_id")
   ) %>%
   power_left_join(
     ptx_rescue_gene_sets_short %>%
@@ -1202,21 +1288,21 @@ ggsave(
 
 
 ```{r}
-feasible_gene_vec <- feasible_genes %>%
-  filter(feasible) %>%
-  pull(gene_id)
 
 ptx_rescue_gene_sets_list <- ptx_rescue_gene_sets_short %>%
   group_by(
-    compound, perturbed, rescue_definition
+    batch, compound, perturbed, rescue_definition
   ) %>%
   summarize(
     gene_vec = list(
-      set_names(
-        # factor(as.integer(feasible_gene_vec %in% gene_id)),
-        if_else(feasible_gene_vec %in% gene_id, .01, 1),
-        feasible_gene_vec
-      )
+      {
+        feasible_gene_vec_cur <- feasible_gene_vec[[cur_group()$batch]]
+        set_names(
+          # factor(as.integer(feasible_gene_vec %in% gene_id)),
+          if_else(feasible_gene_vec_cur %in% gene_id, .01, 1),
+          feasible_gene_vec_cur
+        )
+      }
     ),
     .groups = "drop"
   )
@@ -1417,20 +1503,16 @@ qsave(
 
 
 ```{r}
-feasible_gene_vec <- feasible_genes %>%
-  filter(feasible) %>%
-  pull(gene_id)
-
 topgo_ptx_rescue_type_list <- ptx_rescue_type_list %>%
   group_by(
-    perturbed, rescue_definition, rescue_type
+    batch, perturbed, rescue_definition, rescue_type
   ) %>%
   summarize(
     gene_vec = list(
       set_names(
         # factor(as.integer(feasible_gene_vec %in% gene_id)),
-        if_else(feasible_gene_vec %in% gene_id, .01, 1),
-        feasible_gene_vec
+        if_else(feasible_gene_vec[[cur_group()$batch]] %in% gene_id, .01, 1),
+        feasible_gene_vec[[cur_group()$batch]]
       )
     ),
     .groups = "drop"
@@ -1515,27 +1597,27 @@ topgo_ptx_rescue_type_list_res %>%
 ```{r}
 ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
   mutate(
-    res = map(
-      gene_vec,
-      \(x) {
-        gs <- intersect(names(x)[x < .05], feasible_gene_vec)
+    res = map2(
+      gene_vec, batch,
+      \(x, batch) {
+        gs <- names(x)[x < .05]
         fora(
           msigdbr_of_interest_gs,
           gs,
-          universe = feasible_gene_vec
+          universe = feasible_gene_vec[[batch]]
         )
       }
     ),
-    res_fisher = map(
-      gene_vec,
-      \(x) {
-        gs <- intersect(names(x)[x < .05], feasible_gene_vec)
+    res_fisher = map2(
+      gene_vec, batch,
+      \(x, batch) {
+        gs <- names(x)[x < .05]
         map(
           msigdbr_of_interest_gs,
           possibly(\(y) {
             fisher.test(
-              feasible_gene_vec %in% gs,
-              feasible_gene_vec %in% y,
+              feasible_gene_vec[[batch]] %in% gs,
+              feasible_gene_vec[[batch]] %in% y,
               alternative = "greater"
             ) %>%
               broom::tidy()
@@ -1549,7 +1631,7 @@ ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
 
 ptx_rescue_overrepresentation <- ptx_rescue_overrepresentation_raw %>%
   transmute(
-    rescue_definition, perturbed, compound,
+    batch, rescue_definition, perturbed, compound,
     res = map2(
       res, res_fisher,
       \(x, y) power_full_join(
@@ -1580,11 +1662,11 @@ Rescued by both, neither, or single drugs
 ```{r}
 ptx_rescue_intersections <- ptx_rescue_type_list %>%
   filter(perturbed != "not perturbed") %>%
-  group_nest(rescue_definition, perturbed, rescue_type) %>%
+  group_nest(batch, rescue_definition, perturbed, rescue_type) %>%
   bind_rows(
     ptx_rescue_type_list %>%
       filter(perturbed != "not perturbed") %>%
-      group_nest(rescue_definition, rescue_type) %>%
+      group_nest(batch, rescue_definition, rescue_type) %>%
       mutate(
         perturbed = "both_up_down"
       )
@@ -1592,27 +1674,27 @@ ptx_rescue_intersections <- ptx_rescue_type_list %>%
 
 ptx_rescue_intersections_overrepresentation_raw <- ptx_rescue_intersections %>%
   mutate(
-    res = map(
-      data,
-      \(x) {
-        gs <- intersect(feasible_gene_vec, x$gene_id)
+    res = map2(
+      data, batch,
+      \(x, batch) {
+        gs <- x$gene_id
         fora(
           msigdbr_of_interest_gs,
           gs,
-          universe = feasible_gene_vec
+          universe = feasible_gene_vec[[batch]]
         )
       }
     ),
-    res_fisher = map(
-      data,
-      \(x) {
-        gs <- intersect(feasible_gene_vec, x$gene_id)
+    res_fisher = map2(
+      data, batch,
+      \(x, batch) {
+        gs <- x$gene_id
         map(
           msigdbr_of_interest_gs,
           possibly(\(y) {
             fisher.test(
-              feasible_gene_vec %in% gs,
-              feasible_gene_vec %in% y,
+              feasible_gene_vec[[batch]] %in% gs,
+              feasible_gene_vec[[batch]] %in% y,
               alternative = "greater"
             ) %>%
               broom::tidy()
@@ -1626,7 +1708,7 @@ ptx_rescue_intersections_overrepresentation_raw <- ptx_rescue_intersections %>%
 
 ptx_rescue_intersections_overrepresentation <- ptx_rescue_intersections_overrepresentation_raw %>%
   transmute(
-    rescue_definition, perturbed, rescue_type,
+    batch, rescue_definition, perturbed, rescue_type,
     res = map2(
       res, res_fisher,
       \(x, y) power_full_join(
@@ -2810,7 +2892,7 @@ ptx_rescue_type_list %>%
   count(perturbed)
 
 ptx_rescue_alluvial_plots <- ptx_rescue_type_list %>%
-  group_nest(rescue_definition) %>%
+  group_nest(batch, rescue_definition) %>%
   mutate(
     alluvial_data = map(
       data,
@@ -2880,8 +2962,8 @@ ptx_rescue_alluvial_plots <- ptx_rescue_type_list %>%
 
 pwalk(
   ptx_rescue_alluvial_plots,
-  \(p, rescue_definition, ...) ggsave(
-    file.path("plots", paste0("ptx_rescue_", rescue_definition, "_alluvium.pdf")),
+  \(p, batch, rescue_definition, ...) ggsave(
+    file.path("plots", paste0("ptx_rescue_", rescue_definition, "_alluvium_", batch, ".pdf")),
     p, width = 6, height = 4
   )
 )

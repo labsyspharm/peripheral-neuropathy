@@ -32,12 +32,82 @@ syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
 raw_counts <- syn("syn69961549") %>%
   read_rds()
 
+meta_batch1 <- syn("syn70686477") %>%
+  read_tsv() %>%
+  mutate(
+    salmon_syn = map_chr(
+      run_accession,
+      \(x) synPluck("syn69961369", paste0(x, ".tar.gz"))
+    ),
+    salmon_tar = map_chr(salmon_syn, syn),
+    ptx = factor(if_else(str_detect(treatment, coll("PTX")), "yes", "no")),
+    gne_495 = factor(if_else(str_detect(treatment, coll("GNE")), "yes", "no")),
+    jnk_in = factor(if_else(str_detect(treatment, coll("JNK")), "yes", "no")),
+    batch = factor(
+      batch,
+      levels = paste("Batch", 1:3),
+      # Mapping unclear!!!
+      labels = c("2022_12", "2023_10", "2023_07")
+    )
+  )
+
 meta_raw <- syn("syn69962755") %>%
   read_excel() %>%
   mutate(
     ptx = factor(if_else(str_detect(condition, coll("PTX")), "yes", "no")),
     gne_495 = factor(if_else(str_detect(condition, coll("GNE")), "yes", "no")),
     jnk_in = factor(if_else(str_detect(condition, coll("JNK")), "yes", "no"))
+  ) %>%
+  nest_join(
+    select(
+      meta_batch1,
+      run_accession, batch, ptx, gne_495, jnk_in
+    ),
+    by = c("batch", "ptx", "gne_495", "jnk_in"),
+    name = "accessions"
+  ) %>%
+  group_by(batch, ptx, gne_495, jnk_in) %>%
+  mutate(
+    run_accession = if_else(
+      sequencing_batch != 1,
+      NA_character_,
+      map2_chr(accessions, seq_len(n()), \(x, y) x$run_accession[y])
+    ),
+    sample_id_sequencing = coalesce(sample_id_sequencing, run_accession)
+  ) %>%
+  ungroup() %>%
+  select(-accessions) %>%
+  mutate(
+    gne_495_3 = if_else(gne_495 == "yes" & experiment == 1, "yes", "no"),
+    jnk_in_3 = if_else(jnk_in == "yes" & experiment == 1, "yes", "no"),
+    gne_495_1 = if_else(gne_495 == "yes" & experiment == 2, "yes", "no"),
+    jnk_in_1 = if_else(jnk_in == "yes" & experiment == 2, "yes", "no"),
+    gne_combined = if_else(
+      gne_495 == "no",
+      "0",
+      if_else(
+        experiment == 1,
+        "3",
+        "1"
+      )
+    ),
+    jnk_combined = if_else(
+      jnk_in == "no",
+      "0",
+      if_else(
+        experiment == 1,
+        "3",
+        "1"
+      )
+    ),
+    across(
+      c(experiment, sequencing_batch),
+      factor
+    ),
+    across(
+      c(ptx, gne_495, jnk_in, gne_495_3, jnk_in_3, gne_495_1, jnk_in_1),
+      \(x) factor(x, levels = c("no", "yes"))
+    )
   )
 
 meta_batch2 <- meta_raw %>%
@@ -54,6 +124,26 @@ meta_batch2 <- meta_raw %>%
 
 tx2gene <- syn("syn69961460") %>%
   read_tsv()
+
+raw_salmon_batch1 <- meta_batch1 %>%
+  mutate(
+    quant_path = map2_chr(
+      salmon_tar, run_accession,
+      \(x, y) {
+        out_dir <- file.path(tempdir(), y)
+        untar(x, files = "quant.sf", exdir = out_dir)
+        file.path(out_dir, "quant.sf")
+      }
+    )
+  ) %>%
+  with(
+    tximport(
+      set_names(quant_path, run_accession),
+      type = "salmon",
+      txIn = TRUE, txOut = FALSE,
+      tx2gene = select(tx2gene, transcript_id, gene_id)
+    )
+  )
 
 raw_salmon_batch2 <- meta_batch2 %>%
   mutate(
@@ -77,12 +167,39 @@ raw_salmon_batch2 <- meta_batch2 %>%
 
 feasible_genes_batch2 <- {raw_salmon_batch2$counts > 5} %>%
   rowSums() %>%
-  { names(.)[. > 3] }
+  { tibble(gene_id = names(.), feasible = . > 3) }
 
-write_lines(
+write_csv(
   feasible_genes_batch2,
-  here("rnaseq", "feasible_genes_batch2.txt.gz")
+  here("rnaseq", "feasible_genes_batch2.csv.gz")
 )
+
+raw_salmon_combined <- meta_raw  %>%
+  mutate(
+    salmon_syn = map_chr(
+      sample_id_sequencing,
+      \(x) synPluck("syn69961369", paste0(x, ".tar.gz"))
+    ),
+    salmon_tar = map_chr(salmon_syn, syn),
+    quant_path = map2_chr(
+      salmon_tar, sample_id_sequencing,
+      \(x, y) {
+        out_dir <- file.path(tempdir(), y)
+        untar(x, files = "quant.sf", exdir = out_dir)
+        file.path(out_dir, "quant.sf")
+      }
+    )
+  ) %>%
+  with(
+    tximport(
+      set_names(quant_path, sample_id_sequencing),
+      type = "salmon",
+      txIn = TRUE, txOut = FALSE,
+      tx2gene = select(tx2gene, transcript_id, gene_id)
+    )
+  )
+
+
 ```
 
 ```{r}
@@ -113,6 +230,35 @@ batch2_counts <- list(
     \(x) as_tibble(x, rownames = "gene_id")
   ) %>%
   bind_rows(.id = "type")
+```
+
+
+```{r}
+p <- batch2_counts %>%
+  filter(type == "raw") %>%
+  select(-type) %>%
+  pivot_longer(
+    -c(gene_id),
+    names_to = "sample_id_sequencing",
+    values_to = "count"
+  ) %>%
+  group_by(sample_id_sequencing) %>%
+  summarize(
+    total_count = sum(count),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sample_id_sequencing = fct_reorder(sample_id_sequencing, total_count)
+  ) %>%
+  ggplot(
+    aes(x = sample_id_sequencing, y = total_count)
+  ) +
+  geom_col()
+
+ggsave(
+  here("rnaseq", "plots", "total_counts_per_sample_batch2.pdf"),
+  p, width = 8, height = 4
+)
 ```
 
 
@@ -364,14 +510,270 @@ hm <- Heatmap(
 hm
 ```
 
+
+## Deseq combined
+
+
+```{r}
+
+feasible_genes_combined <- {raw_salmon_combined$counts > 5} %>%
+  rowSums() %>%
+  { tibble(gene_id = names(.), feasible = . > 3) }
+
+raw_salmon_combined_feasible <- raw_salmon_combined %>%
+  imap(
+    \(x, nm) {
+      if (nm %in% c("counts", "abundance", "length")) {
+        x[feasible_genes_combined$feasible, ]
+      } else {
+        x
+      }
+    }
+  )
+
+de_combined <- DESeqDataSetFromTximport(
+  raw_salmon_combined_feasible,
+  meta_raw,
+  design = ~batch + sequencing_batch + ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3,
+) %>%
+  DESeq() %>%
+  nbinomWaldTest(maxit = 1000)
+#  + ptx:gne_495_3 + ptx:jnk_in_3,
+
+
+combined_counts <- list(
+  raw = counts(de_combined, normalized = FALSE),
+  normalized = counts(de_combined, normalized = TRUE),
+  vst = vst(de_combined) %>%
+    assay()
+) %>%
+  map(
+    \(x) as_tibble(x, rownames = "gene_id")
+  ) %>%
+  bind_rows(.id = "type")
+```
+
+```{r}
+pca_combined_raw <- combined_counts %>%
+  filter(type == "vst") %>%
+  select(-type) %>%
+  column_to_rownames("gene_id") %>%
+  t() %>%
+  prcomp(center = TRUE, scale = FALSE)
+
+pca_x_combined <- pca_combined_raw$x %>%
+  as_tibble(rownames = "sample_id_sequencing") %>%
+  power_inner_join(
+    meta_raw,
+    by = "sample_id_sequencing",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+pca_sd_combined <- broom::tidy(pca_combined_raw, "eigenvalues")
+
+p <- ggplot(
+  pca_x_combined %>%
+    mutate(
+      rescue = case_when(
+        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
+        gne_495 == "yes" ~ "GNE-495",
+        jnk_in == "yes" ~ "JNK-inh",
+        TRUE ~ "none"
+      )
+    ),
+  aes(
+    x = PC3, y = PC4,
+    color = ptx,
+    fill = rescue,
+    shape = batch,
+    text = sample_id_sequencing
+  )
+) +
+  geom_point(
+    alpha = .7
+  ) +
+  scale_shape_manual(
+    values = c(21, 22, 23, 24, 25)
+  ) +
+  scale_color_manual(
+    values = c(
+      "no" = "grey70",
+      "yes" = "black"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "none" = "grey70",
+      "GNE-495" = "red",
+      "JNK-inh" = "blue",
+      "GNE-495 + JNK-inh" = "purple"
+    )
+  ) +
+  guides(
+    fill = guide_legend(override.aes = list(shape = 21, color = NA))
+  )
+p
+plotly::ggplotly(p)
+
+
+p <- ggplot(
+  pca_x_combined %>%
+    mutate(
+      rescue = case_when(
+        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
+        gne_495 == "yes" ~ "GNE-495",
+        jnk_in == "yes" ~ "JNK-inh",
+        TRUE ~ "none"
+      )
+    ),
+  aes(
+    x = PC1, y = PC2,
+    color = ptx,
+    fill = rescue,
+    shape = sequencing_batch
+  )
+) +
+  geom_point(
+    alpha = .7
+  ) +
+  scale_shape_manual(
+    values = c(21, 22)
+  ) +
+  scale_color_manual(
+    values = c(
+      "no" = "grey70",
+      "yes" = "black"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "none" = "grey70",
+      "GNE-495" = "red",
+      "JNK-inh" = "blue",
+      "GNE-495 + JNK-inh" = "purple"
+    )
+  ) +
+  guides(
+    fill = guide_legend(override.aes = list(shape = 21, color = NA)),
+    color = guide_legend(override.aes = list(shape = 21, fill = NA))
+  )
+p
+```
+
+
+
+```{r}
+single_gene_data <- meta_raw %>%
+  mutate(
+    expression = raw_salmon_combined$counts["ENSG00000109084", ] %>%
+      log10()
+  )
+
+mdl <- lm(
+  expression ~ batch + sequencing_batch + ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3,
+  data = single_gene_data
+)
+
+desired_contrasts <- tribble(
+  ~name, ~numerator, ~denominator,
+  "GNE-495", "no yes no", "no no no",
+  "JNK-inh", "no no yes", "no no no",
+  "GNE-495 + PTX", "yes yes no", "no no no",
+  "JNK-inh + PTX", "yes no yes", "no no no",
+  "PTX", "yes no no", "no no no",
+  "GNE-495 + PTX vs PTX", "yes yes no", "yes no no",
+  "JNK-inh + PTX vs PTX", "yes no yes", "yes no no",
+  "GNE-495 + JNK-inh + PTX vs PTX", "yes yes yes", "yes no no",
+  "GNE-495 + JNK-inh", "no yes yes", "no no no",
+  "GNE-495 + JNK-inh + PTX vs JNK-inh + PTX", "yes yes yes", "yes no yes",
+  "GNE-495 + JNK-inh + PTX vs GNE-495 + PTX", "yes yes yes", "yes yes no"
+)
+
+library(emmeans)
+mdl_emm_batch_2 <- emmeans(
+  mdl, ~ptx + gne_495_1 + jnk_in_1,
+  at = list(gne_495_3 = "no", jnk_in_3 = "no")
+)
+
+mdl_emm_batch_1 <- emmeans(
+  mdl, ~ptx + gne_495_3 + jnk_in_3,
+  at = list(gne_495_1 = "no", jnk_in_1 = "no")
+)
+
+res_emm <- list(
+  batch_1 = mdl_emm_batch_1,
+  batch_2 = mdl_emm_batch_2
+) %>%
+  map(
+    \(x) {
+      contr <- contrast(x, method = "revpairwise")
+      contr@grid %>%
+        as_tibble() %>%
+        mutate(
+          contrast_vec = asplit(contr@linfct, 1)
+        )
+    }
+  ) %>%
+  bind_rows(.id = "batch") %>%
+  mutate(
+    res = map(
+      contrast_vec,
+      \(x) {
+        contrast_de <- set_names(
+          x[colnames(model.matrix(mdl))],
+          resultsNames(de_combined)
+        )
+        extract_deseq_result(
+          de_combined,
+          contrast = contrast_de
+        )
+      }
+    )
+  )
+
+res_emm_long <- desired_contrasts %>%
+  mutate(
+    contrast = paste(numerator, "-", denominator)
+  ) %>%
+  power_inner_join(
+    res_emm,
+    by = "contrast",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn"
+    )
+  ) %>%
+  select(-c(numerator, denominator, contrast, contrast_vec)) %>%
+  unnest(res) %>%
+  power_inner_join(
+    distinct(tx2gene, gene_id, gene_name),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+write_csv(
+  res_emm_long,
+  here("rnaseq", "combined_deseq2_emm_results.csv.gz")
+)
+```
+
+
+
 ```{r}
 synStoreMany(
   c(
     here("rnaseq", "batch2_deseq2_emm_results.csv.gz"),
-    here("rnaseq", "feasible_genes_batch2.txt.gz")
+    here("rnaseq", "feasible_genes_batch2.csv.gz"),
+    here("rnaseq", "combined_deseq2_emm_results.csv.gz")
   ),
   parentId = "syn69968963",
-  forceVersion = FALSE,
-  used = meta_batch2$salmon_syn
+  forceVersion = FALSE
 )
 ```

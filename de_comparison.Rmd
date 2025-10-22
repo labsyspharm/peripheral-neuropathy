@@ -1,0 +1,149 @@
+---
+title: "Peripheral neuropathy comparison DE analyses"
+author: "Clemens Hug"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+
+library(conflicted)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(base::setdiff)
+conflicts_prefer(dplyr::count)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Reading DEA results
+
+DEA performed by Riki Kawaguchi from UCLA
+
+```{r}
+de_riki <- syn("syn63854283") %>%
+  readxl::read_excel()
+
+de_riki_long <- de_riki %>%
+  select(
+    -c(F, F.pValue, AvgExpr, matches("S[0-9]+_.+"))
+  ) %>%
+  pivot_longer(
+    -c(gene_id, gene_name, gene_type, Description, chromosome, strand),
+    names_to = c("metric", "contrast"),
+    names_pattern = "(.*?)_(.*)",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = metric,
+    values_from = value
+  ) %>%
+  mutate(
+    FDR_min_zero = if_else(FDR == 0, min(FDR[FDR > 0]) * .5, FDR),
+    signed_padj = -sign(logFC) * log10(FDR_min_zero),
+    across(
+      gene_id,
+      \(x) str_remove(x, "\\.[0-9]+")
+    )
+  )
+
+contrast_map <- c(
+  "GNE.495.DMSO_vs_DMSO" = "GNE-495",
+  "JNK.inh.DMSO_vs_DMSO" = "JNK-inh",
+  "GNE.495.PTX_vs_DMSO" = "GNE-495 + PTX",
+  "JNK.inh.PTX_vs_DMSO" = "JNK-inh + PTX",
+  "PTX_vs_DMSO" = "PTX",
+  "GNE.495.PTX_vs_PTX" = "GNE-495 + PTX vs PTX",
+  "JNK.inh.PTX_vs_PTX" = "JNK-inh + PTX vs PTX"
+)
+
+de_riki_selected <- de_riki_long %>%
+  filter(contrast %in% names(contrast_map)) %>%
+  mutate(
+    contrast = contrast_map[contrast],
+    perturbed = case_when(
+      FDR > .05 ~ "not perturbed",
+      logFC > 0 ~ "up",
+      logFC < 0 ~ "down",
+      TRUE ~ NA_character_
+    )
+  )
+
+de_new <- syn("syn70743215") %>%
+  read_csv() %>%
+  mutate(
+    signed_padj = -sign(log2FoldChange) * log10(padj)
+  )
+```
+
+
+```{r}
+riki_vs_new <- power_inner_join(
+  de_riki_selected %>%
+    select(-gene_name),
+  de_new,
+  by = c("gene_id", "contrast" = "name"),
+  suffix = c("_riki", "_new"),
+  check = check_specs(
+    unmatched_keys_left = "info",
+    unmatched_keys_right = "info",
+    duplicate_keys_left = "warn"
+  )
+)
+
+p <- riki_vs_new %>%
+  filter(batch == "batch_1", contrast == "PTX") %>%
+  ggplot(
+    aes(
+      signed_padj_riki, signed_padj_new
+    )
+  ) +
+  geom_point(alpha = .8, shape = 16)
+p
+
+p <- riki_vs_new %>%
+  filter(batch == "batch_1", contrast == "JNK-inh") %>%
+  ggplot(
+    aes(
+      signed_padj_riki, signed_padj_new
+    )
+  ) +
+  geom_point(alpha = .8, shape = 16)
+p
+
+p <- ggplot(
+  riki_vs_new %>%
+    mutate(
+      batch = recode(
+        batch,
+        batch_1 = "Batch 1 (3uM)",
+        batch_2 = "Batch 2 (1uM)"
+      )
+    ),
+  aes(
+    signed_padj_riki, signed_padj_new
+  )
+) +
+  ggrastr::rasterize(geom_point(alpha = .7, shape = 16), dpi = 200) +
+  facet_wrap(
+    ~contrast + batch,
+    scales = "free"
+  ) +
+  labs(
+    x = "Old -sign(log2FoldChange) * log10(FDR)",
+    y = "New -sign(log2FoldChange) * log10(padj)"
+  ) +
+  theme_minimal()
+
+ggsave(
+  file.path("rnaseq", "plots", "de_comparison_new_vs_old_signed_p.pdf"),
+  p, width = 10, height = 10
+)
+```

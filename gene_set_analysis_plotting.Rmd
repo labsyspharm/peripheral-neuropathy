@@ -77,11 +77,9 @@ fgsea_res_single_treatments <- fgsea_res_pert %>%
   filter(
     metric == "signed_padj"
   ) %>%
-  separate_wider_delim(
-    pathway,
-    delim = "_",
-    names = c("database", "pathway"),
-    too_many = "merge"
+  mutate(
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS)"),
+    pathway = str_remove(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS)_")
   ) %>%
   filter(
     database == "REACTOME",
@@ -93,7 +91,7 @@ fgsea_res_single_treatments <- fgsea_res_pert %>%
 
 ps <- fgsea_res_single_treatments %>%
   group_nest(
-    contrast
+    batch, contrast
   ) %>%
   mutate(
     p = map2(
@@ -139,13 +137,43 @@ ps <- fgsea_res_single_treatments %>%
 
 pwalk(
   ps,
-  \(contrast, p, ...) {
+  \(batch, contrast, p, ...) {
     ggsave(
-      file.path("plots", paste0("reactome_", contrast, "_bars.pdf")),
+      file.path("plots", paste0("reactome_", batch, "_", contrast, "_bars.pdf")),
       p, width = 8, height = 8
     )
   }
 )
+```
+
+### Compare batch 1 vs batch 2
+
+```{r}
+fgsea_res_pert_vs <- fgsea_res_pert %>%
+  mutate(
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS)"),
+    pathway = str_remove(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS)_"),
+    sign = if_else(NES > 0, "pos", "neg"),
+    signed_padj = -sign(NES) * log10(padj)
+  ) %>%
+  pivot_wider(
+    names_from = batch,
+    values_from = c(pval, padj, log2err, ES, NES, leadingEdge, sign, size, signed_padj)
+  )
+
+p <- fgsea_res_pert_vs %>%
+  ggplot(
+    aes(
+      x = signed_padj_batch1,
+      y = signed_padj_batch2
+    )
+  ) +
+  geom_point(
+    shape = 16, alpha = .7
+  ) +
+  facet_grid(
+    contrast ~ metric
+  )
 ```
 
 ### Comparison with combination treatment
@@ -2558,7 +2586,7 @@ hm <- Heatmap(
   cluster_columns = FALSE,
   show_row_names = TRUE
 )
-
+hm
 
 pca_fun <- function(mat, meta) {
   pca <- prcomp(t(mat), center = TRUE, scale = FALSE)
