@@ -32,10 +32,7 @@ fgsea_res_pert <- syn("syn64461445") %>%
 fgsea_res_rescue <- syn("syn64461444") %>%
   qread()
 
-de_long_selected <- syn("syn64582734") %>%
-  read_csv()
-
-feasible_genes <- syn("syn64582742") %>%
+de_long_selected <- syn("syn70748503") %>%
   read_csv()
 
 fgsea_overrep <- syn("syn64582959") %>%
@@ -1308,7 +1305,7 @@ fgsea_intersection_overrep_data %>%
 ps <- fgsea_intersection_overrep_data %>%
   filter(perturbed %in% c("up", "down")) %>%
   group_nest(
-    rescue_type, rescue_definition
+    batch, rescue_type, rescue_definition
   ) %>%
   mutate(
     p = pmap(
@@ -1361,9 +1358,9 @@ dir.create(
 
 pwalk(
   ps,
-  \(rescue_definition, rescue_type, p, ...) {
+  \(batch, rescue_definition, rescue_type, p, ...) {
     ggsave(
-      file.path("plots", "overrep", paste0("overrep_intersection_", rescue_definition, "_", rescue_type, "_bars.pdf")),
+      file.path("plots", "overrep", paste0("overrep_intersection_", batch, "_", rescue_definition, "_", rescue_type, "_bars.pdf")),
       p, width = 8, height = 8
     )
   }
@@ -1396,7 +1393,7 @@ fgsea_intersection_dotplot_data <- fgsea_intersection_overrep_data %>%
   #   directed_estimate = if_else(direction == "up", estimate, -estimate)
   # ) %>%
   group_nest(
-    rescue_definition
+    batch, rescue_definition
   ) %>%
   mutate(
     p = map(
@@ -1542,7 +1539,7 @@ fgsea_intersection_overrep_data_single <- fgsea_intersection_overrep_data %>%
     perturbed %in% c("up", "down")
   ) %>%
   group_by(
-    rescue_definition, rescue_type, database, pathway_db, pathway
+    batch, rescue_definition, rescue_type, database, pathway_db, pathway
   ) %>%
   summarize(
     direction = case_when(
@@ -1585,7 +1582,7 @@ fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single
     directed_estimate = if_else(direction == "up", estimate, -estimate)
   ) %>%
   group_nest(
-    rescue_definition
+    batch, rescue_definition
   ) %>%
   crossing(
     p_threshold = c(0.005, 0.001, .01)

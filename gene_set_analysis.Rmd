@@ -17,6 +17,7 @@ library(conflicted)
 conflicts_prefer(dplyr::select)
 conflicts_prefer(dplyr::filter)
 conflicts_prefer(base::setdiff)
+conflicts_prefer(dplyr::count)
 
 synapser::synLogin()
 syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
@@ -57,16 +58,13 @@ de_long <- de_raw %>%
   #   delim = regex("(?<=^[^_]*)_")
   # )
 
-de_long_batch2 <- syn("syn69968964") %>%
+de_long_combined <- syn("syn70743215") %>%
   read_csv() %>%
   replace_na(list(padj = 1)) %>%
   mutate(
     padj_min_zero = if_else(padj == 0, min(padj[padj > 0], na.rm = TRUE) * .5, padj),
     signed_padj = -sign(log2FoldChange) * log10(padj_min_zero)
   )
-
-feasible_genes_batch2 <- syn("syn70094663") %>%
-  read_csv()
 ```
 
 
@@ -98,7 +96,9 @@ contrast_map <- c(
   "JNK.inh.PTX_vs_DMSO" = "JNK-inh + PTX",
   "PTX_vs_DMSO" = "PTX",
   "GNE.495.PTX_vs_PTX" = "GNE-495 + PTX vs PTX",
-  "JNK.inh.PTX_vs_PTX" = "JNK-inh + PTX vs PTX"
+  "JNK.inh.PTX_vs_PTX" = "JNK-inh + PTX vs PTX",
+  "GNE-495 + JNK-inh",
+  "GNE-495 + JNK-inh + PTX"
 )
 
 de_long_selected <- de_long %>%
@@ -113,11 +113,12 @@ de_long_selected <- de_long %>%
     )
   )
 
-de_batch2_selected <- de_long_batch2 %>%
+de_combined_selected <- de_long_combined %>%
   filter(
     name %in% contrast_map
   ) %>%
   transmute(
+    batch,
     contrast = name,
     gene_id, gene_name,
     logFC = log2FoldChange,
@@ -134,47 +135,14 @@ de_batch2_selected <- de_long_batch2 %>%
   )
 
 de_long_selected_both <- bind_rows(
-  batch1 = de_long_selected,
-  batch2 = de_batch2_selected,
-  .id = "batch"
+  de_long_selected %>%
+    mutate(batch = "batch_1_riki"),
+  de_combined_selected
 )
 
 write_csv(
   de_long_selected_both,
   "de_long_selected_both.csv.gz"
-)
-```
-
-
-## Plotting batch 1 vs 2
-
-```{r}
-de_long_selected_vs <- de_long_selected_both %>%
-  select(batch, gene_id, gene_name, contrast, logFC, FDR, signed_padj) %>%
-  pivot_wider(
-    names_from = batch,
-    values_from = c(logFC, FDR, signed_padj),
-    names_sep = "_"
-  )
-
-p <- ggplot(
-  de_long_selected_vs,
-  aes(
-    x = signed_padj_batch1,
-    y = signed_padj_batch2
-  )
-) +
-  geom_point(
-    alpha = .7,
-    shape = 16
-  ) +
-  facet_wrap(
-    ~contrast, scales = "free"
-  )
-p
-ggsave(
-  file.path("plots", "batch1_vs_batch2_signed_padj_scatter.pdf"),
-  p, width = 7, height = 8, device = cairo_pdf
 )
 ```
 
@@ -210,16 +178,19 @@ feasible_genes_batch1 <- raw_counts_long %>%
   )
 
 feasible_genes <- bind_rows(
-  batch1 = feasible_genes_batch1,
-  batch2 = feasible_genes_batch2,
-  .id = "batch"
+  feasible_genes_batch1 %>%
+    mutate(batch = "batch_1_riki"),
+  de_long_combined %>%
+    distinct(gene_id) %>%
+    mutate(feasible = TRUE) %>%
+    crossing(batch = c("batch_1", "batch_2"))
 )
 
 write_csv(
   feasible_genes,
   "feasible_genes.csv.gz"
 )
-feasible_genes <- read_csv("feasible_genes.csv.gz")
+# feasible_genes <- read_csv("feasible_genes.csv.gz")
 ```
 
 ## Transform counts
@@ -866,8 +837,6 @@ msigdbr_of_interest <- all_msigdbr %>%
       "CP:KEGG",
       "CP:REACTOME",
       "CP:KEGG_MEDICUS"
-      # "GO:BP",
-      # "GO:MF"
     )
   )
 
@@ -3427,6 +3396,7 @@ synStoreMany(
     "topgo_ptx_rescue_type_list_res.csv.gz",
     "de_meta.csv.gz",
     "transformed_counts_ruvk4.csv.gz",
+    "de_long_selected_both.csv.gz",
     file.path(
       "results",
       c(
