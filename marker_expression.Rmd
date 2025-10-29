@@ -1,0 +1,247 @@
+---
+title: "Peripheral neuropathy gene set analysis"
+author: "Clemens Hug"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+library(httr2)
+library(ggbeeswarm)
+
+library(conflicted)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(base::setdiff)
+conflicts_prefer(dplyr::count)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Reading counts
+
+```{r}
+tx2gene <- syn("syn69961460") |>
+  read_tsv()
+
+combined_counts_all <- syn("syn70780244") |>
+  read_csv() |>
+  power_left_join(
+    distinct(
+      tx2gene, gene_id, gene_name
+    ),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+meta_combined <- syn("syn70780412") |>
+  read_csv()
+```
+
+## Reading and mapping marker genes
+
+```{r}
+sensory_neuron_genes_raw <- syn("syn70780284") |>
+  readxl::read_excel() |>
+  select(-starts_with(fixed("..."))) |>
+  pivot_longer(
+    everything(),
+    names_to = "gene_set",
+    values_to = "gene_name"
+  ) |>
+  drop_na() |>
+  bind_rows(
+    tibble(
+      gene_set = "MAP4K",
+      gene_name = c("MAP4K4", "MAP4K6", "TNIK", "JNK1", "JNK2")
+    )
+  ) |>
+  bind_rows(
+    tibble(
+      gene_set = "Muscle",
+      gene_name = c("MYH1", "ACTA1", "TNNI2", "MYL1", "MYOD1", "CKM", "MYOG")
+    )
+  )
+
+symbol_mapping <- request("https://www.genenames.org/cgi-bin/tools/symbol-check") |>
+  req_body_form(
+    approved = "true", case = "insensitive",
+    output = "html", previous = "true",
+    synonyms = "true", unmatched = "true",
+    withdrawn = "true",
+    `queries[]` = unique(sensory_neuron_genes_raw$gene_name),
+    .multi = "explode"
+  ) |>
+  req_perform() |>
+  resp_body_json(simplifyVector = TRUE)
+
+sensory_neuron_genes <- sensory_neuron_genes_raw |>
+  power_left_join(
+    select(symbol_mapping, input, approvedSymbol, matchType) |>
+      mutate(
+        across(matchType, \(x) fct_relevel(x, "Approved symbol"))
+      ) |>
+      group_by(input) |>
+      arrange(matchType) |>
+      slice(1) |>
+      ungroup(),
+    by = c("gene_name" = "input"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+```
+
+## Plotting baseline expression
+
+
+```{r}
+vst_counts <- combined_counts_all |>
+  filter(
+    type %in% c("vst_batch_removed")
+  ) |>
+  power_inner_join(
+    select(
+      sensory_neuron_genes,
+      gene_set, approvedSymbol, gene_name_original = gene_name
+    ),
+    by = c("gene_name" = "approvedSymbol"),
+    check = check_specs(
+      unmatched_keys_right = "warn"
+    )
+  ) |>
+  pivot_longer(
+    -c(type, gene_id, gene_name, gene_set, gene_name_original),
+    names_to = "sample_id_sequencing",
+    values_to = "vst_expression"
+  ) |>
+  power_inner_join(
+    meta_combined,
+    by = "sample_id_sequencing",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  )
+
+
+```
+
+```{r}
+dmso_counts <- vst_counts |>
+  filter(
+    str_detect(condition, coll("dmso", ignore_case = TRUE))
+  ) |>
+  mutate(
+    across(starts_with("gene_name"), \(x) fct_reorder(x, vst_expression, .fun = median)),
+    across(gene_set, \(x) fct_relevel(x, "Muscle", after = Inf)),
+    gene_id_unique = paste0(gene_id, "_", gene_set),
+    # vst_expression = 2**vst_expression - 1,
+    # vst_expression_p = if_else(
+    #   vst_expression > 0,
+    #   vst_expression,
+    #   min(vst_expression[vst_expression > 0], na.rm = TRUE) * .5
+    # )
+  )
+
+p <- dmso_counts |>
+  ggplot(
+    aes(
+      x = gene_name_original,
+      y = vst_expression,
+      color = gene_set
+    )
+  ) +
+  geom_quasirandom(alpha = .5, shape = 16) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  paletteer::scale_color_paletteer_d(
+    "ggsci::default_jco",
+    guide = "none"
+  ) +
+  # scale_y_log10() +
+  labs(
+    x = NULL,
+    y = "Batch corrected variance stabilized count"
+  ) +
+  facet_grid(
+    cols = vars(gene_set),
+    rows = vars(type),
+    scales = "free_x",
+    space = "free_x",
+    axes = "all",
+    axis.labels = "margins"
+  ) +
+  envalysis::theme_publish() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+p
+
+ggsave(
+  file.path("plots", "marker_expression_baseline_vst_beeswarm.pdf"),
+  p, width = 12, height = 4.5
+)
+```
+
+
+```{r}
+library(ComplexHeatmap)
+
+dmso_count_mat <- dmso_counts |>
+  select(gene_id_unique, sample_id_sequencing, vst_expression) |>
+  pivot_wider(
+    names_from = sample_id_sequencing,
+    values_from = vst_expression
+  ) |>
+  column_to_rownames("gene_id_unique") |>
+  as.matrix()
+  # magrittr::add(1) |>
+  # log2()
+
+row_meta <- dmso_counts |>
+  distinct(gene_set, gene_id_unique, gene_name_original) |>
+  slice(
+    match(rownames(dmso_count_mat), gene_id_unique)
+  )
+
+hm <- Heatmap(
+  dmso_count_mat,
+  col = circlize::colorRamp2(
+    seq(
+      quantile(dmso_count_mat, probs = 0.025, na.rm = TRUE),
+      quantile(dmso_count_mat, probs = 0.975, na.rm = TRUE),
+      length.out = 100
+    ),
+    viridisLite::viridis(100)
+  ),
+  name = "Batch corrected\nvariance stabilized\ncount",
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  row_labels = row_meta$gene_name_original,
+  row_split = row_meta$gene_set
+)
+hm
+
+withr::with_pdf(
+  file.path("plots", "marker_expression_baseline_vst_heatmap.pdf"),
+  draw(hm),
+  width = 6, height = 9
+)
+```
