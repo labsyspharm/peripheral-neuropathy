@@ -71,6 +71,12 @@ sensory_neuron_genes_raw <- syn("syn70780284") |>
       gene_set = "Muscle",
       gene_name = c("MYH1", "ACTA1", "TNNI2", "MYL1", "MYOD1", "CKM", "MYOG")
     )
+  ) |>
+  bind_rows(
+    tibble(
+      gene_set = "Pluripotency",
+      gene_name = c("NANOG", "POU5F1")
+    )
   )
 
 symbol_mapping <- request("https://www.genenames.org/cgi-bin/tools/symbol-check") |>
@@ -110,7 +116,7 @@ sensory_neuron_genes <- sensory_neuron_genes_raw |>
 ```{r}
 vst_counts <- combined_counts_all |>
   filter(
-    type %in% c("vst_batch_removed")
+    type %in% c("vst_batch_removed", "tpm_batch_removed")
   ) |>
   power_inner_join(
     select(
@@ -139,62 +145,115 @@ vst_counts <- combined_counts_all |>
 
 ```
 
+Due to batch correction, some TPM values are negative!
+Snapping these to zero and adding half of smallest non-zero
+TPM before batch correction for plotting
+
 ```{r}
 dmso_counts <- vst_counts |>
   filter(
     str_detect(condition, coll("dmso", ignore_case = TRUE))
   ) |>
   mutate(
-    across(starts_with("gene_name"), \(x) fct_reorder(x, vst_expression, .fun = median)),
-    across(gene_set, \(x) fct_relevel(x, "Muscle", after = Inf)),
-    gene_id_unique = paste0(gene_id, "_", gene_set),
-    # vst_expression = 2**vst_expression - 1,
-    # vst_expression_p = if_else(
-    #   vst_expression > 0,
-    #   vst_expression,
-    #   min(vst_expression[vst_expression > 0], na.rm = TRUE) * .5
-    # )
+    across(
+      gene_set,
+      \(x) fct_relevel(x, "Muscle", after = Inf) |>
+        fct_relevel("Pluripotency", after = 0L)
+    ),
+    gene_id_unique = paste0(gene_id, "_", gene_set)
   )
 
-p <- dmso_counts |>
-  ggplot(
-    aes(
-      x = gene_name_original,
-      y = vst_expression,
-      color = gene_set
-    )
-  ) +
-  geom_quasirandom(alpha = .5, shape = 16) +
-  geom_boxplot(fill = NA, outlier.shape = NA) +
-  paletteer::scale_color_paletteer_d(
-    "ggsci::default_jco",
-    guide = "none"
-  ) +
-  # scale_y_log10() +
-  labs(
-    x = NULL,
-    y = "Batch corrected variance stabilized count"
-  ) +
-  facet_grid(
-    cols = vars(gene_set),
-    rows = vars(type),
-    scales = "free_x",
-    space = "free_x",
-    axes = "all",
-    axis.labels = "margins"
-  ) +
-  envalysis::theme_publish() +
-  theme(
-    axis.text.x = element_text(
-      angle = 45,
-      hjust = 1
-    )
-  )
-p
+write_csv(
+  dmso_counts,
+  file.path("rnaseq", "dmso_counts_vst_batch_removed.csv.gz")
+)
 
-ggsave(
-  file.path("plots", "marker_expression_baseline_vst_beeswarm.pdf"),
-  p, width = 12, height = 4.5
+zero_add_tpm <- combined_counts_all |>
+  filter(type == "tpm") |>
+  pivot_longer(
+    -c(type, gene_id, gene_name),
+    names_to = "sample_id_sequencing",
+    values_to = "tpm"
+  ) |>
+  summarize(
+    tpm = min(tpm[tpm > 0], na.rm = TRUE) * .5
+  ) |>
+  pull(tpm)
+
+ps <- dmso_counts |>
+  group_nest(type) |>
+  rowwise() |>
+  mutate(
+    p = {
+      d <- data |>
+        mutate(
+          across(starts_with("gene_name"), \(x) fct_reorder(x, vst_expression, .fun = median))
+        )
+      if (type == "tpm_batch_removed") {
+        d <- d |>
+          mutate(
+            across(vst_expression, \(x) pmax((2**x) - 1, zero_add_tpm))
+          )
+      }
+      p <- ggplot(
+        d,
+        aes(
+          x = gene_name_original,
+          y = vst_expression,
+          color = gene_set
+        )
+      ) +
+      geom_quasirandom(alpha = .5, shape = 16) +
+      geom_boxplot(fill = NA, outlier.shape = NA) +
+      paletteer::scale_color_paletteer_d(
+        "ggsci::default_jco",
+        guide = "none"
+      ) +
+      # scale_y_log10() +
+      labs(
+        x = NULL,
+        y = if (type == "vst_batch_removed") {
+          "Batch corrected variance stabilized count"
+        } else {
+          "Batch corrected TPM"
+        }
+      ) +
+      facet_grid(
+        cols = vars(gene_set),
+        rows = NULL,
+        scales = "free_x",
+        space = "free_x",
+        axes = "all",
+        axis.labels = "margins"
+      ) +
+      envalysis::theme_publish() +
+      theme(
+        axis.text.x = element_text(
+          angle = 45,
+          hjust = 1
+        )
+      )
+      if (type == "tpm_batch_removed") {
+        p <- p + scale_y_log10() +
+          geom_hline(
+            yintercept = zero_add_tpm,
+            color = "gray",
+            linetype = "dashed"
+          )
+      }
+      p
+    } |>
+      list()
+  )
+
+pwalk(
+  ps,
+  \(type, p, ...) {
+    ggsave(
+      file.path("plots", paste0("marker_expression_baseline_", type, "_beeswarm.pdf")),
+      p, width = 13.5, height = 4.2
+    )
+  }
 )
 ```
 
