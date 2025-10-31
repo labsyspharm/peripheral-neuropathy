@@ -12,6 +12,7 @@ library(data.table)
 library(synExtra)
 library(qs)
 library(powerjoin)
+library(openxlsx)
 
 library(conflicted)
 conflicts_prefer(dplyr::select)
@@ -28,10 +29,10 @@ syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
 DEA performed by Riki Kawaguchi from UCLA
 
 ```{r}
-de_raw <- syn("syn63854283") %>%
+de_riki_raw <- syn("syn63854283") %>%
   readxl::read_excel()
 
-de_long <- de_raw %>%
+de_riki_long <- de_riki_raw %>%
   select(
     -c(F, F.pValue, AvgExpr, matches("S[0-9]+_.+"))
   ) %>%
@@ -57,8 +58,15 @@ de_long <- de_raw %>%
   #   -c(gene_id, gene_name, gene_type, Description, chromosome, strand),
   #   delim = regex("(?<=^[^_]*)_")
   # )
+```
 
-de_long_combined <- syn("syn70743215") %>%
+And our own from combined analysis of the first and second sequencing run
+
+```{r}
+meta_combined <- syn("syn70780412") %>%
+  read_csv()
+
+de_long_combined <- syn("syn70777776") %>%
   read_csv() %>%
   replace_na(list(padj = 1)) %>%
   mutate(
@@ -67,41 +75,27 @@ de_long_combined <- syn("syn70743215") %>%
   )
 ```
 
-
-
-```{r}
-raw_counts_ruvk4 <- de_raw %>%
-  select(
-    gene_id, gene_name, gene_type,
-    # only gene expression
-    matches("^S[0-9]+_[^\\._]+$")
-  ) %>%
-  pivot_longer(
-    -c(gene_id, gene_name, gene_type),
-    names_to = c("sample_id", "condition"),
-    names_pattern = "(S[0-9]+)_(.*)",
-    values_to = "count"
-  )
-
-```
-
+Using k = 0 (explicit batch effects only, no additional nuisance variables)
+for this analysis
 
 ```{r}
-dplyr::distinct(de_long, contrast)
+dplyr::distinct(de_riki_long, contrast)
+dplyr::distinct(de_long_combined, name)
 
 contrast_map <- c(
+  "PTX_vs_DMSO" = "PTX",
   "GNE.495.DMSO_vs_DMSO" = "GNE-495",
   "JNK.inh.DMSO_vs_DMSO" = "JNK-inh",
   "GNE.495.PTX_vs_DMSO" = "GNE-495 + PTX",
   "JNK.inh.PTX_vs_DMSO" = "JNK-inh + PTX",
-  "PTX_vs_DMSO" = "PTX",
   "GNE.495.PTX_vs_PTX" = "GNE-495 + PTX vs PTX",
   "JNK.inh.PTX_vs_PTX" = "JNK-inh + PTX vs PTX",
   "GNE-495 + JNK-inh",
-  "GNE-495 + JNK-inh + PTX"
+  "GNE-495 + JNK-inh + PTX",
+  "GNE-495 + JNK-inh + PTX vs PTX"
 )
 
-de_long_selected <- de_long %>%
+de_riki_long_selected <- de_riki_long %>%
   filter(contrast %in% names(contrast_map)) %>%
   mutate(
     contrast = contrast_map[contrast],
@@ -115,7 +109,8 @@ de_long_selected <- de_long %>%
 
 de_combined_selected <- de_long_combined %>%
   filter(
-    name %in% contrast_map
+    name %in% contrast_map,
+    k == 0
   ) %>%
   transmute(
     batch,
@@ -135,7 +130,7 @@ de_combined_selected <- de_long_combined %>%
   )
 
 de_long_selected_both <- bind_rows(
-  de_long_selected %>%
+  de_riki_long_selected %>%
     mutate(batch = "batch_1_riki"),
   de_combined_selected
 )
@@ -144,156 +139,20 @@ write_csv(
   de_long_selected_both,
   "de_long_selected_both.csv.gz"
 )
+
+feasible_genes <- de_long_selected_both %>%
+  distinct(batch, gene_id)
 ```
 
-
-## Reading raw counts
+## Reading counts
 
 ```{r}
-raw_counts <- syn("syn63854604") %>%
+counts_trans <- syn("syn70780244") %>%
   read_csv()
 
-raw_counts_long <- raw_counts %>%
-  pivot_longer(
-    -c(gene_id, gene_name, gene_type, Description, chromosome, strand),
-    names_to = c("sample_id", "condition"),
-    names_pattern = "(S[0-9]+)_(.*)",
-    values_to = "value"
-  ) %>%
-  mutate(
-    across(
-      gene_id,
-      \(x) str_remove(x, "\\.[0-9]+")
-    )
-  )
-
-gene_id_gene_symbol_map <- raw_counts_long %>%
-  distinct(gene_id, gene_name)
-
-feasible_genes_batch1 <- raw_counts_long %>%
-  group_by(gene_id) %>%
-  summarize(
-    feasible = sum(value > 5) > 3,
-    .groups = "drop"
-  )
-
-feasible_genes <- bind_rows(
-  feasible_genes_batch1 %>%
-    mutate(batch = "batch_1_riki"),
-  de_long_combined %>%
-    distinct(gene_id) %>%
-    mutate(feasible = TRUE) %>%
-    crossing(batch = c("batch_1", "batch_2"))
-)
-
-write_csv(
-  feasible_genes,
-  "feasible_genes.csv.gz"
-)
-# feasible_genes <- read_csv("feasible_genes.csv.gz")
-```
-
-## Transform counts
-
-```{r}
-de_meta <- raw_counts_long %>%
-  distinct(sample_id, condition) %>%
-  mutate(
-    paclitaxel = if_else(str_detect(condition, "PTX"), "PTX", "DMSO"),
-    treatment = case_when(
-      str_detect(condition, "GNE495") ~ "GNE-495",
-      str_detect(condition, "JNKinh") ~ "JNK-inh",
-      TRUE ~ "DMSO"
-    )
-  )
-
-write_csv(
-  de_meta,
-  "de_meta.csv.gz"
-)
-
-de_all_ruvk4 <- DESeq2::DESeqDataSetFromMatrix(
-  raw_counts_ruvk4 %>%
-    select(gene_id, sample_id, count) %>%
-    pivot_wider(names_from = sample_id, values_from = count) %>%
-    # S36 missing for some reason...
-    select(gene_id, any_of(de_meta$sample_id)) %>%
-    column_to_rownames("gene_id") %>%
-    as.matrix(),
-  de_meta %>%
-    filter(sample_id %in% raw_counts_ruvk4$sample_id),
-  design = ~ condition
-) %>%
-  DESeq2::estimateSizeFactors()
-```
-
-```{r}
-counts_trans_ruvk4 <- list(
-  vsn = SummarizedExperiment::assay(DESeq2::varianceStabilizingTransformation(de_all_ruvk4, blind = FALSE)),
-  rlog = SummarizedExperiment::assay(DESeq2::rlog(de_all_ruvk4, blind = FALSE)),
-  normalized = DESeq2::counts(de_all_ruvk4, normalized = TRUE),
-  raw = DESeq2::counts(de_all_ruvk4, normalized = FALSE)
-) %>%
-  map(
-    \(x) as_tibble(x, rownames = "gene_id")
-  ) %>%
-  bind_rows(.id = "transformation") %>%
-  mutate(
-    across(gene_id, \(x) str_remove(x, "\\.\\d+$"))
-  ) %>%
-  select(transformation, gene_id, everything())
-
-write_csv(
-  counts_trans_ruvk4,
-  "transformed_counts_ruvk4.csv.gz"
-)
-```
-
-
-```{r}
-de_all_ruvk4 <- DESeq2::DESeqDataSetFromMatrix(
-  raw_counts_long %>%
-    select(gene_id, sample_id, value) %>%
-    pivot_wider(names_from = sample_id, values_from = value) %>%
-    column_to_rownames("gene_id") %>%
-    as.matrix() %>%
-    {.[, de_meta$sample_id]},
-  de_meta,
-  design = ~ condition
-) %>%
-  DESeq2::estimateSizeFactors()
-```
-
-```{r}
-counts_trans <- list(
-  vsn = SummarizedExperiment::assay(DESeq2::varianceStabilizingTransformation(de_all, blind = FALSE)),
-  rlog = SummarizedExperiment::assay(DESeq2::rlog(de_all, blind = FALSE)),
-  normalized = DESeq2::counts(de_all, normalized = TRUE),
-  raw = DESeq2::counts(de_all, normalized = FALSE)
-) %>%
-  map(
-    \(x) as_tibble(x, rownames = "gene_id")
-  ) %>%
-  bind_rows(.id = "transformation") %>%
-  mutate(
-    across(gene_id, \(x) str_remove(x, "\\.\\d+$"))
-  ) %>%
-  select(transformation, gene_id, everything())
-
-
-write_csv(
-  counts_trans,
-  "transformed_counts.csv.gz"
-)
-```
-
-
-```{r}
-counts_trans <- read_csv("transformed_counts.csv.gz")
-
 rlog_mat <- counts_trans %>%
-  filter(transformation == "rlog") %>%
-  dplyr::select(-transformation) %>%
+  filter(type == "vst_batch_removed") %>%
+  dplyr::select(-type) %>%
   column_to_rownames("gene_id") %>%
   as.matrix()
 
@@ -304,9 +163,9 @@ rlog_scaled <- rlog_mat %>%
 
 dmso_means <- rlog_mat[
   ,
-  de_meta %>%
-    filter(condition == "DMSO") %>%
-    pull(sample_id)
+  meta_combined %>%
+    filter(str_detect(condition, coll("dmso", ignore_case = TRUE))) %>%
+    pull(sample_id_sequencing)
 ] %>%
   rowMeans()
 
@@ -318,177 +177,6 @@ rlog_scaled2 <- {
   scale(center = FALSE) %>%
   t()
 
-```
-
-## Volcano plot
-
-```{r}
-compute_point_density <- function(df, x_col, y_col, ...) {
-  x <- df[[x_col]]
-  y <- df[[y_col]]
-
-  # Use more robust bandwidth estimation
-  bw_x <- diff(quantile(x, c(0.25, 0.75))) / 1.34 * 2
-  bw_y <- diff(quantile(y, c(0.25, 0.75))) / 1.34 * 2
-
-
-  # Compute the 2D kernel density
-  kde <- MASS::kde2d(
-    x, y,
-    h = c(bw_x, bw_y),
-    lims = c(
-      range(x) + c(-1, 1) * bw_x,
-      range(y) + c(-1, 1) * bw_y
-    ),
-    ...
-  )
-
-  # Find density at each point by interpolation
-  point_density <- fields::interp.surface(
-    obj = list(x = kde$x, y = kde$y, z = kde$z),
-    loc = cbind(x, y)
-  )
-
-  df %>%
-    mutate(.density = point_density)
-}
-
-de_long_selected %>%
-  compute_point_density("logFC", "signed_padj")
-
-picked_ptx_vs_dmso_genes <- c(
-  "TUBB4B", "TUBB3", "TUBB", "TUBA1A", "TUBB2B", "KCNJ10", "KCNJ13", "CACNG3", "KCNK4", "CASP3",
-  "ACAT2", "ASS1", "IDH1", "LSS", "ACSS2", "SUCNR1", "ASCL4"
-)
-
-ps <- de_long_selected %>%
-  group_nest(contrast) %>%
-  mutate(
-    p = pmap(
-      .,
-      \(contrast, data, ...) {
-        p_data <- data %>%
-          mutate(
-            nlog10_FDR = -log10(FDR)
-          ) %>%
-          filter(is.finite(nlog10_FDR)) %>%
-          compute_point_density("logFC", "nlog10_FDR", n = 100)
-
-        # Use manually selected genes for PTX
-        if (contrast == "PTX") {
-          p_data <- p_data %>%
-            mutate(
-              gene_name_repel = if_else(
-                # .density < quantile(.density, .002) |
-                gene_name %in% picked_ptx_vs_dmso_genes,
-                gene_name,
-                ""
-              )
-            )
-        } else {
-          p_data <- p_data %>%
-            mutate(
-              gene_name_repel = if_else(
-                .density < quantile(.density, .002),
-                gene_name,
-                ""
-              )
-            )
-        }
-
-        ggplot(
-          p_data %>%
-            filter(gene_type == "protein_coding") %>%
-            arrange(
-              match(perturbed, c("not perturbed", "down", "up"))
-            ),
-          aes(
-            x = logFC,
-            y = nlog10_FDR,
-            text = gene_name
-          )
-        ) +
-          ggrastr::rasterize(geom_point(
-            aes(color = perturbed),
-            alpha = .5,
-            shape = 16
-          ), dpi = 300, dev = "ragg") +
-          geom_vline(
-            xintercept = 0,
-            color = "gray",
-            linetype = "dashed"
-          ) +
-          geom_hline(
-            yintercept = -log10(.05),
-            color = "gray",
-            linetype = "dashed"
-          ) +
-          scale_color_manual(
-            values = c("not perturbed" = "gray", "up" = "#762a83", "down" = "#1b7837")
-          ) +
-          geom_text(
-            aes(
-              x = if_else(perturbed == "down", -Inf, Inf),
-              hjust = if_else(perturbed == "down", 0, 1),
-              label = paste(n, perturbed)
-            ),
-            data = \(x) dplyr::count(x, perturbed) %>%
-              filter(perturbed != "not perturbed"),
-            y = Inf,
-            vjust = 1,
-            inherit.aes = FALSE
-          ) +
-          # ggnewscale::new_scale_color() +
-          geom_text_repel(
-            # if (contrast == "PTX")
-            #   aes(
-            #     label = gene_name_repel,
-            #     color = gene_name %in% picked_ptx_vs_dmso_genes
-            #   )
-            # else
-            aes(
-              label = gene_name_repel
-            ),
-            max.iter = 1e5,
-            max.time = 5,
-            max.overlaps = Inf,
-            size = 2,
-            seed = 42,
-            force = 5,
-            min.segment.length = 0
-          ) +
-          # scale_color_manual(
-          #   values = c(`TRUE` = "red", `FALSE` = "black"),
-          #   guide = "none"
-          # ) +
-          labs(
-            x = "log2 fold-change",
-            y = "-log10(adjusted p-value)",
-            title = paste(contrast, "vs DMSO")
-          )
-      }
-    )
-  )
-
-pwalk(
-  ps,
-  \(contrast, p, ...) {
-    ggsave(
-      file.path("plots", paste0("volcano_", contrast, "_raster.pdf")),
-      p, width = 6, height = 4
-    )
-  }
-)
-
-x <- plotly::ggplotly(
-  ps$p[[7]]
-)
-
-htmlwidgets::saveWidget(
-  x,
-  file = "plots/volcano_PT_vs_DMSO.html",
-  selfcontained = FALSE
-)
 ```
 
 
@@ -648,6 +336,16 @@ ptx_rescue_by_compound <- de_long_selected_both %>%
         names_sep = " "
       ),
     by = c("batch", "gene_id")
+  ) |>
+  crossing(
+    perturbed_threshold = c(.001, .01, .05)
+  ) %>%
+  mutate(
+    perturbed = case_when(
+      FDR < perturbed_threshold & logFC > 0 ~ "up",
+      FDR < perturbed_threshold & logFC < 0 ~ "down",
+      TRUE ~ "not perturbed"
+    )
   )
 
 ptx_rescue_list <- ptx_rescue_by_compound %>%
@@ -673,7 +371,7 @@ ptx_rescue_list <- ptx_rescue_by_compound %>%
 
 ptx_rescue_list_neat <- ptx_rescue_list %>%
   select(
-    batch, gene_id, compound, perturbed,
+    perturbed_threshold, batch, gene_id, compound, perturbed,
     starts_with("rescue")
   )
 
@@ -711,7 +409,6 @@ write_csv(
 )
 ```
 
-
 ```{r}
 rd_bu_colors <- RColorBrewer::brewer.pal(5, "RdBu")
 rescue_type_colors <- c(
@@ -722,6 +419,172 @@ rescue_type_colors <- c(
   `no rescue` = "gray70"
 )
 ```
+
+## Create Excel sheets
+
+```{r}
+gtf_path <- file.path("rnaseq", "Homo_sapiens.GRCh38.114.gtf.gz")
+if (!file.exists(gtf_path))
+  download.file("ftp://ftp.ensembl.org/pub/release-114/gtf/homo_sapiens/Homo_sapiens.GRCh38.114.gtf.gz", gtf_path)
+
+symbol_path <- file.path("rnaseq", "non_alt_loci_set.txt")
+if (!file.exists(symbol_path))
+  download.file("https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/non_alt_loci_set.txt", symbol_path)
+symbol_info <- read_tsv(symbol_path)
+
+gtf_raw <- rtracklayer::import(gtf_path)
+gene_info <- gtf_raw %>%
+  as_tibble() %>%
+  filter(type == "gene") %>%
+  distinct(
+    gene_id, gene_name, gene_biotype, chromosome = seqnames
+  )
+
+recode_batch <- \(x) recode(x, batch_1 = "(3uM)", batch_2 = "(1uM)", batch_1_riki = "(3uM, Riki)")
+
+de_sheet <- de_long_selected_both %>%
+  mutate(
+    contrast = factor(contrast, levels = intersect(contrast_map, contrast))
+  ) %>%
+  arrange(contrast) %>%
+  # filter(!(contrast == "PTX" & batch == "batch_2")) %>%
+  transmute(
+    gene_id,
+    contrast = paste(contrast, recode_batch(batch)),
+    logFC, FDR
+  ) %>%
+  filter(
+    contrast != "PTX (1uM)"
+  ) %>%
+  mutate(
+    contrast = recode(contrast, "PTX (3uM)" = "PTX", "PTX (3uM, Riki)" = "PTX (Riki)")
+  ) %>%
+  pivot_wider(
+    names_from = contrast,
+    values_from = c(logFC, FDR),
+    names_glue = "{contrast}_{.value}",
+    names_vary = "slowest"
+  ) %>%
+  power_inner_join(
+    gene_info,
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  power_left_join(
+    distinct(symbol_info, gene_name = symbol, gene_description = name),
+    by = "gene_name",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  relocate(
+    gene_id, gene_name, gene_description, gene_biotype, chromosome,
+    .before = 1
+  ) %>%
+  power_left_join(
+    ptx_rescue_type_list %>%
+      transmute(
+        batch = recode_batch(batch),
+        rescue_definition = fct_relevel(rescue_definition, "significant_opposite"),
+        gene_id, rescue_definition, rescue_type
+      ) %>%
+      arrange(rescue_definition) %>%
+      pivot_wider(
+        names_from = c(rescue_definition, batch),
+        values_from = rescue_type,
+        names_glue = "rescue_{rescue_definition}_{batch}",
+        names_vary = "fastest"
+      ),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+dir.create(file.path("tables"), showWarnings = FALSE)
+
+rescue_type_styles <- rescue_type_colors %>%
+  map(
+    \(x) createStyle(fgFill = colorspace::lighten(x, amount = .5))
+  )
+
+significant_style <- createStyle(fontColour = "red")
+
+de_table_wb <- createWorkbook()
+addWorksheet(de_table_wb, "DGE results")
+writeDataTable(de_table_wb, "DGE results", de_sheet, tableStyle = "TableStyleLight8")
+walk(
+  which(str_detect(names(de_sheet), coll("FDR"))),
+  \(i) {
+    data_rows <- nrow(de_sheet) + 1L  # +1 for header
+    de_col_data <- de_sheet[[i]]
+    significant_rows <- which(!is.na(de_col_data) & de_col_data < 0.05) + 1L  # +1 for header
+    if (length(significant_rows) > 0) {
+      addStyle(
+        wb = de_table_wb,
+        sheet = "DGE results",
+        style = significant_style,
+        rows = significant_rows,
+        cols = i,
+        gridExpand = FALSE
+      )
+    }
+  }
+)
+walk(
+  which(str_detect(names(de_sheet), coll("logFC"))),
+  \(i) {
+    data_rows <- nrow(de_sheet) + 1L  # +1 for header
+    conditionalFormatting(
+      wb = de_table_wb,
+      sheet = "DGE results",
+      cols = i,
+      rows = 2:data_rows,
+      type = "colourScale",
+      style = c("#4575b4", "white", "#d73027"),
+      rule = c(-3, 0, 3)
+    )
+  }
+)
+walk(
+  which(str_detect(names(de_sheet), coll("rescue_"))),
+  \(i) {
+    iwalk(
+      rescue_type_styles,
+      \(style, rescue_type) {
+        rows <- which(
+          de_sheet[[i]] == rescue_type
+        ) + 1L
+        # browser()
+        addStyle(
+          wb = de_table_wb,
+          sheet = "DGE results",
+          style = style,
+          rows = rows,
+          cols = i,
+          gridExpand = TRUE
+        )
+      }
+    )
+  }
+)
+setColWidths(de_table_wb, "DGE results", cols = seq_len(ncol(de_sheet)), widths = "auto")
+
+saveWorkbook(de_table_wb, file.path("tables", "de_results.xlsx"), overwrite = TRUE)
+```
+
+
+## Plot rescue plots with rescue types
+
 
 ```{r}
 ptx_rescue_plot_data_w_type <- ptx_rescue_plot_data %>%
@@ -857,6 +720,8 @@ msigdbr_of_interest_gs <- msigdbr_of_interest %>%
 
 ## FGSEA
 
+### Rescue vectors
+
 Linear scale most rescued by agent to most not rescued. Only including
 genes perturbed by PTX
 
@@ -873,7 +738,7 @@ Options
 library(fgsea)
 
 feasible_gene_vec <- with(
-  filter(feasible_genes, feasible),
+  feasible_genes,
   split(gene_id, batch)
 )
 
@@ -996,7 +861,7 @@ plotEnrichment(
 ```{r}
 fgsea_pert_input <- de_long_selected_both %>%
   semi_join(
-    filter(feasible_genes, feasible),
+    feasible_genes,
     by = c("batch", "gene_id")
   ) %>%
   select(
@@ -1008,7 +873,7 @@ fgsea_pert_input <- de_long_selected_both %>%
     values_to = "value"
   ) %>%
   group_by(
-    batch, contrast, metric,
+    batch, contrast, metric
   ) %>%
   summarize(
     gene_stats = set_names(
@@ -1131,122 +996,6 @@ write_gct(
 
 ## topGO
 
-```{r}
-library(topGO)
-
-ptx_rescue_gene_sets <- ptx_rescue_by_compound %>%
-  mutate(
-    return_baseline = case_when(
-      perturbed == "not perturbed" ~ "not perturbed",
-      `FDR + PTX` > .05 ~ "yes",
-      `FDR + PTX` <= .05 ~ "no",
-      TRUE ~ NA_character_
-    ),
-    significant_opposite = case_when(
-      perturbed == "not perturbed" ~ "not perturbed",
-      perturbed == "up" & `FDR + PTX vs PTX` <= .05 & `logFC + PTX vs PTX` < 0 ~ "yes",
-      perturbed == "down" & `FDR + PTX vs PTX` <= .05 & `logFC + PTX vs PTX` > 0 ~ "yes",
-      TRUE ~ "no"
-    ),
-    overshot = case_when(
-      is.na(perturbed) | perturbed == "not perturbed" ~ "not perturbed",
-      perturbed == "up" & `FDR + PTX` <= .05 & `logFC + PTX` < 0 ~ "yes",
-      perturbed == "down" & `FDR + PTX` <= .05 & `logFC + PTX` > 0 ~ "yes",
-      TRUE ~ "no"
-    )
-  )
-
-ptx_rescue_gene_sets_short <- bind_rows(
-  ptx_rescue_gene_sets %>%
-    dplyr::select(
-      batch, gene_id, compound, perturbed, return_baseline, significant_opposite, overshot
-    ) %>%
-    filter(perturbed != "not perturbed") %>%
-    pivot_longer(
-      -c(batch, gene_id, compound, perturbed),
-      names_to = "rescue_definition",
-      values_to = "rescue"
-    ) %>%
-    filter(rescue == "yes"),
-  ptx_rescue_gene_sets %>%
-    distinct(
-      batch, gene_id, perturbed,
-      rescue_definition = "perturbed",
-      rescue = if_else(
-        perturbed == "not perturbed",
-        "no",
-        "yes"
-      )
-    ) %>%
-    mutate(compound = "PTX") %>%
-    filter(rescue == "yes")
-)
-
-ptx_rescue_gene_sets %>%
-  dplyr::count(
-    batch, compound, perturbed,
-    return_baseline, significant_opposite, overshot
-  ) %>%
-  View()
-```
-
-
-```{r}
-### Have to fix the `complete()` statement below to include all genes in
-ptx_rescue_2_plot_data <- ptx_rescue_plot_data %>%
-  mutate(
-    across(
-      contrast_2, \(x) str_remove(x, fixed(" + PTX"))
-    )
-  ) %>%
-  semi_join(
-    filter(feasible_genes, feasible),
-    by = c("batch", "gene_id")
-  ) %>%
-  power_left_join(
-    ptx_rescue_gene_sets_short %>%
-      filter(compound != "PTX") %>%
-      mutate(
-        gene_id = factor(gene_id, levels = feasible_genes$gene_id)
-      ) %>%
-      complete(gene_id, compound, perturbed, rescue_definition, fill = list(rescue = "no")),
-    by = c("gene_id", "contrast_2" = "compound")
-  )
-
-p <- ptx_rescue_2_plot_data %>%
-  arrange(rescue) %>%
-  ggplot(
-    aes(
-      x = logFC_1,
-      y = logFC_2,
-      color = rescue
-    )
-  ) +
-  ggrastr::rasterize(geom_point(
-    alpha = .5, shape = 16
-  ), dpi = 250, dev = "ragg") +
-  scale_color_manual(
-    values = c(yes = "red", no = "black")
-  ) +
-  coord_fixed() +
-  facet_grid(
-    contrast_2  ~ rescue_definition
-  ) +
-  geom_abline(
-    slope = 1, intercept = 0,
-    color = "gray", linetype = "dashed"
-  ) +
-  labs(
-    x = "log2(FC) PTX vs DMSO",
-    y = "log2(FC) Compound + PTX vs PTX",
-    color = "Rescue"
-  )
-
-ggsave(
-  file.path("plots", "ptx_rescue_2_plot.pdf"),
-  p, width = 12, height = 8
-)
-```
 
 1. Use significant opposite rscue edfinition
 2. Define PTX, GNE, JNK effects alone using GO enrichment
@@ -1255,12 +1004,13 @@ ggsave(
 5. Make two big heatmaps of gene expression, group by PTX up/down, JNK/GNE rescue
 6. Make TF enrichment for just raw JNK/GNE effects
 
+### On PTX rescue gene sets
 
 ```{r}
-
-ptx_rescue_gene_sets_list <- ptx_rescue_gene_sets_short %>%
+ptx_rescue_gene_sets_list <- ptx_rescue_list_long %>%
+  filter(rescue == "rescued") %>%
   group_by(
-    batch, compound, perturbed, rescue_definition
+    perturbed_threshold, batch, compound, perturbed, rescue_definition
   ) %>%
   summarize(
     gene_vec = list(
@@ -1276,20 +1026,31 @@ ptx_rescue_gene_sets_list <- ptx_rescue_gene_sets_short %>%
     .groups = "drop"
   )
 
+library(topGO)
+
 gene_sel_fun <- \(x) x < .05
 
-topgo_objects <- c("BP", "MF", "CC") %>%
-  set_names() %>%
-  map(
-    \(x) new(
-      "topGOdata",
-      ontology = x,
-      allGenes = ptx_rescue_gene_sets_list$gene_vec[[1]],
-      geneSel = gene_sel_fun,
-      nodeSize = 10,
-      annot = annFUN.org,
-      ID = "ensembl",
-      mapping = "org.Hs.eg.db"
+topgo_objects <- ptx_rescue_gene_sets_list %>%
+  group_by(batch) %>%
+  slice_head(n = 1L) %>%
+  ungroup() %>%
+  crossing(
+    ontology = c("BP", "MF", "CC")
+  ) %>%
+  transmute(
+    batch, ontology,
+    object = map2(
+      ontology, gene_vec,
+      \(o, g) new(
+        "topGOdata",
+        ontology = o,
+        allGenes = g,
+        geneSel = gene_sel_fun,
+        nodeSize = 10,
+        annot = annFUN.org,
+        ID = "ensembl",
+        mapping = "org.Hs.eg.db"
+      )
     )
   )
 
@@ -1297,32 +1058,38 @@ qsave(
   topgo_objects,
   "topgo_objects.qs"
 )
-topgo_objects <- qread("topgo_objects.qs")
+# topgo_objects <- qread("topgo_objects.qs")
 
-go_gene_map <- map(
-  topgo_objects,
-  \(x) x@graph@nodes %>%
-    set_names() %>%
-    map(\(y) genesInTerm(x, y)[[1]])
-) %>%
-  # unlist(recursive = FALSE)
-  {do.call(c, .)}
+# go_gene_map <- map(
+#   topgo_objects,
+#   \(x) x@graph@nodes %>%
+#     set_names() %>%
+#     map(\(y) genesInTerm(x, y)[[1]])
+# ) %>%
+#   # unlist(recursive = FALSE)
+#   {do.call(c, .)}
 
-qsave(
-  go_gene_map,
-  "go_gene_map.qs"
-)
-go_gene_map <- qread("go_gene_map.qs")
+# qsave(
+#   go_gene_map,
+#   "go_gene_map.qs"
+# )
+# go_gene_map <- qread("go_gene_map.qs")
 
 topgo_res_raw <- ptx_rescue_gene_sets_list %>%
-  crossing(
-    ontology = names(topgo_objects)
+  power_inner_join(
+    topgo_objects,
+    by = "batch",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
   ) %>%
   rowwise() %>%
   mutate(
     res = {
+      o <- object
       go <- updateGenes(
-        topgo_objects[[ontology]],
+        o,
         geneList = gene_vec,
         geneSelFun = gene_sel_fun
       )
@@ -1348,10 +1115,11 @@ topgo_res_raw <- ptx_rescue_gene_sets_list %>%
   ungroup()
 
 qsave(
-  topgo_res_raw,
+  topgo_res_raw %>%
+   select(-object),
   "topgo_res_raw.qs"
 )
-topgo_res_raw <- qread("topgo_res_raw.qs")
+# topgo_res_raw <- qread("topgo_res_raw.qs")
 
 topgo_res <- topgo_res_raw %>%
   rowwise() %>%
@@ -1359,7 +1127,7 @@ topgo_res <- topgo_res_raw %>%
     res_table = list(res[["res"]])
   ) %>%
   ungroup() %>%
-  dplyr::select(-c(res, gene_vec)) %>%
+  dplyr::select(-c(res, gene_vec, object)) %>%
   unnest(res_table) %>%
   mutate(
     term_unique = paste(
@@ -1372,7 +1140,7 @@ qsave(
   topgo_res,
   "topgo_res.qs"
 )
-topgo_res <- qread("topgo_res.qs")
+# topgo_res <- qread("topgo_res.qs")
 
 go_meta <- topgo_res %>%
   distinct(
@@ -1474,7 +1242,7 @@ qsave(
 ```{r}
 topgo_ptx_rescue_type_list <- ptx_rescue_type_list %>%
   group_by(
-    batch, perturbed, rescue_definition, rescue_type
+    perturbed_threshold, batch, perturbed, rescue_definition, rescue_type
   ) %>%
   summarize(
     gene_vec = list(
@@ -1489,14 +1257,20 @@ topgo_ptx_rescue_type_list <- ptx_rescue_type_list %>%
 
 
 topgo_ptx_rescue_type_list_raw <- topgo_ptx_rescue_type_list %>%
-  crossing(
-    ontology = names(topgo_objects)
+  power_inner_join(
+    topgo_objects,
+    by = "batch",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
   ) %>%
   rowwise() %>%
   mutate(
     res = {
+      o <- object
       go <- updateGenes(
-        topgo_objects[[ontology]],
+        o,
         geneList = gene_vec,
         geneSelFun = gene_sel_fun
       )
@@ -1522,10 +1296,11 @@ topgo_ptx_rescue_type_list_raw <- topgo_ptx_rescue_type_list %>%
   ungroup()
 
 qsave(
-  topgo_ptx_rescue_type_list_raw,
+  topgo_ptx_rescue_type_list_raw %>%
+   select(-object),
   "topgo_ptx_rescue_type_list_raw.qs"
 )
-topgo_ptx_rescue_type_list_raw <- qread("topgo_ptx_rescue_type_list_raw.qs")
+# topgo_ptx_rescue_type_list_raw <- qread("topgo_ptx_rescue_type_list_raw.qs")
 
 topgo_ptx_rescue_type_list_res <- topgo_ptx_rescue_type_list_raw %>%
   rowwise() %>%
@@ -1533,7 +1308,7 @@ topgo_ptx_rescue_type_list_res <- topgo_ptx_rescue_type_list_raw %>%
     res_table = list(res[["res"]])
   ) %>%
   ungroup() %>%
-  dplyr::select(-c(res, gene_vec)) %>%
+  dplyr::select(-c(res, gene_vec, object)) %>%
   unnest(res_table) %>%
   mutate(
     term_unique = paste(
@@ -1546,7 +1321,7 @@ write_csv(
   topgo_ptx_rescue_type_list_res,
   "topgo_ptx_rescue_type_list_res.csv.gz"
 )
-topgo_ptx_rescue_type_list_res <- read_csv("topgo_ptx_rescue_type_list_res.csv.gz")
+# topgo_ptx_rescue_type_list_res <- read_csv("topgo_ptx_rescue_type_list_res.csv.gz")
 
 topgo_ptx_rescue_type_list_res %>%
   filter(
@@ -1584,6 +1359,7 @@ ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
         map(
           msigdbr_of_interest_gs,
           possibly(\(y) {
+            browser()
             fisher.test(
               feasible_gene_vec[[batch]] %in% gs,
               feasible_gene_vec[[batch]] %in% y,
@@ -1600,7 +1376,7 @@ ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
 
 ptx_rescue_overrepresentation <- ptx_rescue_overrepresentation_raw %>%
   transmute(
-    batch, rescue_definition, perturbed, compound,
+    perturbed_threshold, batch, rescue_definition, perturbed, compound,
     res = map2(
       res, res_fisher,
       \(x, y) power_full_join(
@@ -1631,11 +1407,11 @@ Rescued by both, neither, or single drugs
 ```{r}
 ptx_rescue_intersections <- ptx_rescue_type_list %>%
   filter(perturbed != "not perturbed") %>%
-  group_nest(batch, rescue_definition, perturbed, rescue_type) %>%
+  group_nest(perturbed_threshold, batch, rescue_definition, perturbed, rescue_type) %>%
   bind_rows(
     ptx_rescue_type_list %>%
       filter(perturbed != "not perturbed") %>%
-      group_nest(batch, rescue_definition, rescue_type) %>%
+      group_nest(perturbed_threshold, batch, rescue_definition, rescue_type) %>%
       mutate(
         perturbed = "both_up_down"
       )
@@ -1674,10 +1450,9 @@ ptx_rescue_intersections_overrepresentation_raw <- ptx_rescue_intersections %>%
     )
   )
 
-
 ptx_rescue_intersections_overrepresentation <- ptx_rescue_intersections_overrepresentation_raw %>%
   transmute(
-    batch, rescue_definition, perturbed, rescue_type,
+    perturbed_threshold, batch, rescue_definition, perturbed, rescue_type,
     res = map2(
       res, res_fisher,
       \(x, y) power_full_join(
@@ -1704,7 +1479,7 @@ qsave(
 ```{r}
 ptx_rescue_intersections_overrepresentation %>%
   filter(rescue_definition == "significant_opposite") %>%
-  filter(rescue_type == "GNE-495 only") %>%
+  filter(rescue_type == "GNE-495 only", batch != "batch_1_riki") %>%
   arrange(p.value_fisher) %>%
   View()
 
@@ -2861,7 +2636,7 @@ ptx_rescue_type_list %>%
   count(perturbed)
 
 ptx_rescue_alluvial_plots <- ptx_rescue_type_list %>%
-  group_nest(batch, rescue_definition) %>%
+  group_nest(perturbed_threshold, batch, rescue_definition) %>%
   mutate(
     alluvial_data = map(
       data,
@@ -2931,8 +2706,8 @@ ptx_rescue_alluvial_plots <- ptx_rescue_type_list %>%
 
 pwalk(
   ptx_rescue_alluvial_plots,
-  \(p, batch, rescue_definition, ...) ggsave(
-    file.path("plots", paste0("ptx_rescue_", rescue_definition, "_alluvium_", batch, ".pdf")),
+  \(p, perturbed_threshold, batch, rescue_definition, ...) ggsave(
+    file.path("plots", paste0("ptx_rescue_threshold_", perturbed_threshold, "_", rescue_definition, "_alluvium_", batch, ".pdf")),
     p, width = 6, height = 4
   )
 )

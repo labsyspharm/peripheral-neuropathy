@@ -110,6 +110,11 @@ meta_raw <- syn("syn69962755") %>%
     )
   )
 
+write_csv(
+  meta_raw,
+  here("rnaseq", "meta_combined.csv.gz")
+)
+
 meta_batch2 <- meta_raw %>%
   filter(
     experiment == 2
@@ -234,7 +239,7 @@ yde <- yk |>
   estimateDisp(design = mm_no_batch, robust = TRUE)
 
 yfit <- yde |>
-  glmQLFit(design = mm_no_batch, robust = TRUE)
+  glmFit(design = mm_no_batch, robust = TRUE)
 
 yset <- newSeqExpressionSet(
   round(raw_salmon_combined$counts[keep, ]),
@@ -323,7 +328,7 @@ yde_w_batch <- yk |>
   estimateDisp(design = mm, robust = TRUE)
 
 yfit_w_batch <- yde_w_batch |>
-  glmQLFit(design = mm, robust = TRUE)
+  glmFit(design = mm, robust = TRUE)
 
 ruv_with_batch <- map(
   1:5,
@@ -396,35 +401,75 @@ ggsave(
 ```
 
 
+## Derive normalized counts
+
+
+### Batch correct counts
+
+Here purposefully using all genes, not just feasible so they appear
+in the VST count table if we need them
 
 ```{r}
-de_batch2 <- DESeqDataSetFromTximport(
-  raw_salmon_batch2,
-  meta_batch2,
-  design = ~ ptx*gne_495*jnk_in*batch
+feasible_genes_combined <- {raw_salmon_combined$counts > 5} %>%
+  rowSums() %>%
+  { tibble(gene_id = names(.), feasible = . > 3) }
+
+raw_salmon_combined_feasible <- raw_salmon_combined %>%
+  imap(
+    \(x, nm) {
+      if (nm %in% c("counts", "abundance", "length")) {
+        x[feasible_genes_combined$feasible, ]
+      } else {
+        x
+      }
+    }
+  )
+
+de_combined <- DESeqDataSetFromTximport(
+  raw_salmon_combined,
+  meta_raw,
+  design = ~batch + sequencing_batch + ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3,
 ) %>%
   DESeq()
-
-de_batch2_reduced <- DESeq(
-    de_batch2,
-    reduced = ~ ptx*gne_495*jnk_in + batch,
-    test = "LRT"
-  )
 
 ```
 
 
 ```{r}
 combined_counts <- list(
-  raw = counts(de_batch2, normalized = FALSE),
-  normalized = counts(de_batch2, normalized = TRUE),
-  vst = vst(de_batch2) %>%
-    assay()
+  raw = counts(de_combined, normalized = FALSE),
+  normalized = counts(de_combined, normalized = TRUE),
+  vst = assay(vst(de_combined, blind = FALSE)),
+  vst_blind = assay(vst(de_combined, blind = TRUE)),
+  vst_batch_removed = removeBatchEffect(
+    assay(vst(de_combined, blind = FALSE)),
+    batch = meta_raw$batch,
+    batch2 = meta_raw$sequencing_batch,
+    design = model.matrix(
+      ~ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3,
+      data = meta_raw
+    )
+  ),
+  tpm = raw_salmon_combined$abundance,
+  tpm_batch_removed = removeBatchEffect(
+    log2(raw_salmon_combined$abundance + 1),
+    batch = meta_raw$batch,
+    batch2 = meta_raw$sequencing_batch,
+    design = model.matrix(
+      ~ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3,
+      data = meta_raw
+    )
+  )
 ) %>%
   map(
     \(x) as_tibble(x, rownames = "gene_id")
   ) %>%
   bind_rows(.id = "type")
+
+write_csv(
+  combined_counts,
+  here("rnaseq", "combined_counts_all.csv.gz")
+)
 ```
 
 
@@ -458,26 +503,44 @@ ggsave(
 
 
 ```{r}
-pca_batch2 <- batch2_counts %>%
-  filter(type == "vst") %>%
-  select(-type) %>%
-  column_to_rownames("gene_id") %>%
-  t() %>%
-  prcomp(center = TRUE, scale = FALSE)
-
-pca_x <- pca_batch2$x %>%
-  as_tibble(rownames = "sample_id_sequencing") %>%
-  power_inner_join(
-    meta_batch2,
-    by = "sample_id_sequencing",
-    check = check_specs(
-      unmatched_keys_left = "warn",
-      unmatched_keys_right = "warn",
-      duplicate_keys_right = "warn"
+pca_combined <- combined_counts %>%
+  filter(type %in% c("vst", "vst_batch_removed")) %>%
+  group_nest(type) %>%
+  mutate(
+    pca = map(
+      data,
+      \(df) {
+        mat <- df %>%
+          column_to_rownames("gene_id") %>%
+          as.matrix()
+        prcomp(
+          t(mat),
+          center = TRUE,
+          scale = FALSE
+        )
+      }
     )
   )
 
-pca_sd <- broom::tidy(pca_batch2, "eigenvalues")
+pca_x <- pca_combined %>%
+  mutate(
+    x = map(
+      pca,
+      \(pca) {
+        as_tibble(
+          pca$x,
+          rownames = "sample_id_sequencing"
+        ) %>%
+          left_join(
+            meta_raw,
+            by = "sample_id_sequencing"
+          )
+      }
+    )
+  ) %>%
+  select(type, x) %>%
+  unnest(x)
+
 ```
 
 ```{r}
@@ -495,14 +558,66 @@ p <- ggplot(
     x = PC1, y = PC2,
     color = ptx,
     fill = rescue,
-    shape = batch
+    shape = batch,
+    text = sample_id_sequencing
   )
 ) +
   geom_point(
     alpha = .7
   ) +
   scale_shape_manual(
-    values = c(21, 24)
+    values = c(21, 22, 23, 24, 25)
+  ) +
+  scale_color_manual(
+    values = c(
+      "no" = NA,
+      "yes" = "black"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      "none" = "grey70",
+      "GNE-495" = "red",
+      "JNK-inh" = "blue",
+      "GNE-495 + JNK-inh" = "purple"
+    )
+  ) +
+  guides(
+    fill = guide_legend(override.aes = list(shape = 21, color = NA)),
+    color = guide_legend(override.aes = list(shape = 21, fill = NA))
+  ) +
+  facet_wrap(~type, scales = "free")
+p
+plotly::ggplotly(p)
+
+ggsave(
+  here("rnaseq", "plots", "pca_combined_vst_pc1_pc2.pdf"),
+  p, width = 10, height = 4
+)
+
+p <- ggplot(
+  pca_x %>%
+    mutate(
+      rescue = case_when(
+        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
+        gne_495 == "yes" ~ "GNE-495",
+        jnk_in == "yes" ~ "JNK-inh",
+        TRUE ~ "none"
+      )
+    ),
+  aes(
+    x = PC3, y = PC4,
+    color = ptx,
+    fill = rescue,
+    shape = sequencing_batch,
+    text = sample_id_sequencing
+  )
+) +
+  geom_point(
+    alpha = .7
+  ) +
+  scale_shape_manual(
+    values = c(21, 22)
   ) +
   scale_color_manual(
     values = c(
@@ -519,15 +634,19 @@ p <- ggplot(
     )
   ) +
   guides(
-    fill = guide_legend(override.aes = list(shape = 21, color = NA))
+    fill = guide_legend(override.aes = list(shape = 21, color = NA)),
+    color = guide_legend(override.aes = list(shape = 21, fill = NA))
+  ) +
+  facet_wrap(
+    ~type, scales = "free"
   )
 p
-
-dir.create(here("rnaseq", "plots"), showWarnings = FALSE)
 ggsave(
-  here("rnaseq", "plots", "pca_batch2_vst_pc1_pc1.pdf"),
-  p, width = 6, height = 4
+  here("rnaseq", "plots", "pca_combined_vst_pc3_pc4.pdf"),
+  p, width = 10, height = 4
 )
+```
+
 ```
 
 
@@ -822,95 +941,7 @@ pca_x_combined <- pca_combined_raw$x %>%
 
 pca_sd_combined <- broom::tidy(pca_combined_raw, "eigenvalues")
 
-p <- ggplot(
-  pca_x_combined %>%
-    mutate(
-      rescue = case_when(
-        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
-        gne_495 == "yes" ~ "GNE-495",
-        jnk_in == "yes" ~ "JNK-inh",
-        TRUE ~ "none"
-      )
-    ),
-  aes(
-    x = PC3, y = PC4,
-    color = ptx,
-    fill = rescue,
-    shape = batch,
-    text = sample_id_sequencing
-  )
-) +
-  geom_point(
-    alpha = .7
-  ) +
-  scale_shape_manual(
-    values = c(21, 22, 23, 24, 25)
-  ) +
-  scale_color_manual(
-    values = c(
-      "no" = "grey70",
-      "yes" = "black"
-    )
-  ) +
-  scale_fill_manual(
-    values = c(
-      "none" = "grey70",
-      "GNE-495" = "red",
-      "JNK-inh" = "blue",
-      "GNE-495 + JNK-inh" = "purple"
-    )
-  ) +
-  guides(
-    fill = guide_legend(override.aes = list(shape = 21, color = NA))
-  )
-p
-plotly::ggplotly(p)
-
-
-p <- ggplot(
-  pca_x_combined %>%
-    mutate(
-      rescue = case_when(
-        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
-        gne_495 == "yes" ~ "GNE-495",
-        jnk_in == "yes" ~ "JNK-inh",
-        TRUE ~ "none"
-      )
-    ),
-  aes(
-    x = PC1, y = PC2,
-    color = ptx,
-    fill = rescue,
-    shape = sequencing_batch
-  )
-) +
-  geom_point(
-    alpha = .7
-  ) +
-  scale_shape_manual(
-    values = c(21, 22)
-  ) +
-  scale_color_manual(
-    values = c(
-      "no" = "grey70",
-      "yes" = "black"
-    )
-  ) +
-  scale_fill_manual(
-    values = c(
-      "none" = "grey70",
-      "GNE-495" = "red",
-      "JNK-inh" = "blue",
-      "GNE-495 + JNK-inh" = "purple"
-    )
-  ) +
-  guides(
-    fill = guide_legend(override.aes = list(shape = 21, color = NA)),
-    color = guide_legend(override.aes = list(shape = 21, fill = NA))
-  )
-p
 ```
-
 ## DGEseq2 DE RUV
 
 ```{r}
@@ -1386,7 +1417,9 @@ synStoreMany(
         "feasible_genes_batch2.csv.gz",
         "combined_deseq2_emm_results.csv.gz",
         "combined_deseq2_emm_ruv_results.csv.gz",
-        "combined_edger_emm_ruv_results.csv.gz"
+        "combined_edger_emm_ruv_results.csv.gz",
+        "combined_counts_all.csv.gz",
+        "meta_combined.csv.gz"
       )
     )
   ),
