@@ -79,8 +79,6 @@ Using k = 0 (explicit batch effects only, no additional nuisance variables)
 for this analysis
 
 ```{r}
-dplyr::distinct(de_riki_long, contrast)
-dplyr::distinct(de_long_combined, name)
 
 contrast_map <- c(
   "PTX_vs_DMSO" = "PTX",
@@ -694,13 +692,17 @@ all_msigdbr <- msigdbr()
 
 msigdbr_of_interest <- all_msigdbr %>%
   filter(
-    gs_collection == "H" |
-    gs_subcollection %in% c(
-      "CP:PID",
-      "CP:KEGG",
-      "CP:REACTOME",
-      "CP:KEGG_MEDICUS"
-    )
+    gs_collection %in% c("H") |
+      gs_subcollection %in% c(
+        "CP:PID",
+        "CP:REACTOME",
+        "CP:KEGG_MEDICUS",
+        "GO:BP",
+        "GO:MF",
+        "GO:CC"
+      ),
+    !str_detect(gs_name, coll("MEDICUS_PATHOGEN")),
+    !str_detect(gs_name, coll("MEDICUS_VARIANT"))
   )
 
 msigdbr_of_interest_gs <- msigdbr_of_interest %>%
@@ -744,7 +746,7 @@ feasible_gene_vec <- with(
 
 fgsea_rescue_vectors <- ptx_rescue_by_compound %>%
   semi_join(
-    filter(feasible_genes, feasible),
+    feasible_genes,
     by = c("batch", "gene_id")
   ) %>%
   mutate(
@@ -903,14 +905,18 @@ qsave(
   fgsea_pert_res,
   "fgsea_pert_res.qs"
 )
-fgsea_pert_res <- qread("fgsea_pert_res.qs")
+# fgsea_pert_res <- qread("fgsea_pert_res.qs")
 ```
 
 
 ```{r}
 fgsea_pert_res %>%
-  arrange(padj) %>%
+  count(batch, contrast, metric, padj < .05) %>%
   View()
+
+fgsea_pert_res %>%
+  arrange(padj) %>%
+  print(n = 100)
 ```
 
 ```{r}
@@ -1351,46 +1357,13 @@ ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
           universe = feasible_gene_vec[[batch]]
         )
       }
-    ),
-    res_fisher = map2(
-      gene_vec, batch,
-      \(x, batch) {
-        gs <- names(x)[x < .05]
-        map(
-          msigdbr_of_interest_gs,
-          possibly(\(y) {
-            browser()
-            fisher.test(
-              feasible_gene_vec[[batch]] %in% gs,
-              feasible_gene_vec[[batch]] %in% y,
-              alternative = "greater"
-            ) %>%
-              broom::tidy()
-          })
-        ) %>%
-          bind_rows(.id = "pathway")
-      }
     )
   )
-
 
 ptx_rescue_overrepresentation <- ptx_rescue_overrepresentation_raw %>%
   transmute(
     perturbed_threshold, batch, rescue_definition, perturbed, compound,
-    res = map2(
-      res, res_fisher,
-      \(x, y) power_full_join(
-        dplyr::rename(x, p.value = pval),
-        mutate(y, padj = p.adjust(p.value, method = "BH")),
-        by = "pathway",
-        suffix = c("_fgsea", "_fisher"),
-        check = check_specs(
-          duplicate_keys_left = "warn",
-          duplicate_keys_right = "warn"
-        )
-      ) %>%
-        as_tibble()
-    )
+    res
   ) %>%
   unnest(res)
 
@@ -1429,44 +1402,13 @@ ptx_rescue_intersections_overrepresentation_raw <- ptx_rescue_intersections %>%
           universe = feasible_gene_vec[[batch]]
         )
       }
-    ),
-    res_fisher = map2(
-      data, batch,
-      \(x, batch) {
-        gs <- x$gene_id
-        map(
-          msigdbr_of_interest_gs,
-          possibly(\(y) {
-            fisher.test(
-              feasible_gene_vec[[batch]] %in% gs,
-              feasible_gene_vec[[batch]] %in% y,
-              alternative = "greater"
-            ) %>%
-              broom::tidy()
-          })
-        ) %>%
-          bind_rows(.id = "pathway")
-      }
     )
   )
 
 ptx_rescue_intersections_overrepresentation <- ptx_rescue_intersections_overrepresentation_raw %>%
   transmute(
     perturbed_threshold, batch, rescue_definition, perturbed, rescue_type,
-    res = map2(
-      res, res_fisher,
-      \(x, y) power_full_join(
-        dplyr::rename(x, p.value = pval),
-        mutate(y, padj = p.adjust(p.value, method = "BH")),
-        by = "pathway",
-        suffix = c("_fgsea", "_fisher"),
-        check = check_specs(
-          duplicate_keys_left = "warn",
-          duplicate_keys_right = "warn"
-        )
-      ) %>%
-        as_tibble()
-    )
+    res
   ) %>%
   unnest(res)
 
@@ -1480,7 +1422,7 @@ qsave(
 ptx_rescue_intersections_overrepresentation %>%
   filter(rescue_definition == "significant_opposite") %>%
   filter(rescue_type == "GNE-495 only", batch != "batch_1_riki") %>%
-  arrange(p.value_fisher) %>%
+  arrange(pval) %>%
   View()
 
 ```
@@ -3090,7 +3032,7 @@ ptx_rescue_type_indra_raw <- ptx_rescue_type_list %>%
     hgnc_mapping,
     by = c("gene_id" = "ensembl_gene_id")
   ) %>%
-  group_by(perturbed, rescue_type) %>%
+  group_by(perturbed_threshold, perturbed, rescue_type) %>%
   summarize(
     res = list(
       safely(indra_discrete_gsea)(

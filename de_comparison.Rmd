@@ -81,6 +81,15 @@ de_new <- syn("syn70743215") %>%
   mutate(
     signed_padj = -sign(log2FoldChange) * log10(padj)
   )
+
+de_new_ruv <- syn("syn71060218") %>%
+  read_csv() %>%
+  mutate(
+    signed_padj = -sign(log2FoldChange) * log10(padj)
+  )
+
+rescue_types <- syn("syn64608138") %>%
+  read_csv()
 ```
 
 
@@ -147,3 +156,51 @@ ggsave(
   p, width = 10, height = 10
 )
 ```
+
+
+## Comparing batch 1 vs batch 2 DE results
+
+```{r}
+de_combined <- bind_rows(
+  batch_regression = de_new,
+  ruv = de_new_ruv,
+  .id = "method"
+)
+
+de_combined_vs <- de_combined %>%
+  pivot_wider(
+    names_from = batch,
+    values_from = -c(method, name, gene_id, gene_name, batch)
+  )
+
+```
+
+```{r}
+p <- ggplot(
+  de_combined_vs,
+  aes(
+    signed_padj_batch_1, signed_padj_batch_2
+  )
+) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    color = "gray",
+    linetype = "dashed"
+  ) +
+  ggrastr::rasterize(geom_point(alpha = .7, shape = 16), dpi = 200) +
+  ggh4x::facet_grid2(
+    vars(method),
+    vars(name),
+    scales = "free",
+    axes = "all"
+  )
+p
+
+ggsave(
+  file.path("rnaseq", "plots", "de_comparison_batch1_vs_batch2_signed_p.pdf"),
+  p, width = 20, height = 6
+)
+```
+
+

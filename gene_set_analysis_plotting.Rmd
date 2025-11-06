@@ -39,11 +39,7 @@ fgsea_overrep <- syn("syn64582959") %>%
   qread()
 
 fgsea_intersection_overrep <- syn("syn64586672") %>%
-  qread() %>%
-  mutate(
-    # avoid weird fucking bug when grouping that values are repeated
-    across(estimate, unname)
-  )
+  qread()
 
 indra_res <- syn("syn64908970") %>%
   read_csv()
@@ -64,6 +60,30 @@ ptx_rescue_types <- syn("syn64608138") %>%
   read_csv()
 ```
 
+```{r}
+database_abbreviations <- c(
+  "REACTOME" = "R",
+  "HALLMARK" = "H",
+  "PID" = "P",
+  "KEGG_MEDICUS" = "K",
+  "GOBP" = "BP",
+  "GOMF" = "MF",
+  "GOCC" = "CC"
+)
+
+abbreviate_prefix <- function(strings, abbr_map = database_abbreviations) {
+  # Create regex pattern from abbreviation names
+  pattern <- paste0("^(", paste(names(abbr_map), collapse = "|"), ")_")
+
+  # Replace matching prefixes with abbreviations
+  str_replace(strings, pattern, function(x) {
+    prefix <- str_remove(x, "_$")
+    paste0(abbr_map[prefix], "_")
+  })
+}
+
+recode_batch <- \(x) recode(x, batch_1 = "(3uM)", batch_2 = "(1uM)", batch_1_riki = "(3uM, Riki)")
+```
 
 
 ## Plot Reactome PTX only and comparison with combination treatment
@@ -75,11 +95,11 @@ fgsea_res_single_treatments <- fgsea_res_pert %>%
     metric == "signed_padj"
   ) %>%
   mutate(
-    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS)"),
-    pathway = str_remove(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS)_")
+    contrast_batch = paste(contrast, recode_batch(batch)),
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway)
   ) %>%
   filter(
-    database == "REACTOME",
     padj < 0.01
   ) %>%
   mutate(
@@ -88,11 +108,11 @@ fgsea_res_single_treatments <- fgsea_res_pert %>%
 
 ps <- fgsea_res_single_treatments %>%
   group_nest(
-    batch, contrast
+    batch, contrast_batch, contrast
   ) %>%
   mutate(
     p = map2(
-      contrast, data,
+      contrast_batch, data,
       \(x, y) {
         y %>%
           mutate(
@@ -122,7 +142,69 @@ ps <- fgsea_res_single_treatments %>%
           labs(
             x = "Normalized enrichment score",
             y = NULL,
-            title = paste0("Reactome pathways enriched in ", x, " treatment"),
+            title = paste0("Pathways enriched in ", x, " treatment"),
+            subtitle = "FDR < 0.01"
+          ) + {
+            if (!any(y$sign == "neg"))
+              lims(x = c(-max(abs(y$NES)), NA))
+          }
+      }
+    )
+  )
+
+dir.create(
+  here("plots", "gene_set_analysis"),
+  showWarnings = FALSE
+)
+
+pwalk(
+  ps,
+  \(contrast_batch, p, ...) {
+    ggsave(
+      here("plots", "gene_set_analysis", paste0("fgsea_single_perturbation_", contrast_batch, "_bars.pdf")),
+      p, width = 8, height = 8
+    )
+  }
+)
+
+ps <- fgsea_res_single_treatments %>%
+  filter(!str_starts(database, coll("GO"))) %>%
+  group_nest(
+    batch, contrast_batch, contrast
+  ) %>%
+  mutate(
+    p = map2(
+      contrast_batch, data,
+      \(x, y) {
+        y %>%
+          mutate(
+            pathway = fct_reorder(pathway, NES)
+          ) %>%
+          ggplot(
+            aes(
+              x = NES,
+              y = pathway,
+              fill = sign
+            )
+          ) +
+          geom_col() +
+          geom_text(
+            aes(
+              x = if_else(sign == "pos", -.05, .05),
+              hjust = if_else(sign == "pos", 1, 0),
+              label = pathway
+            ),
+            size = 2
+          ) +
+          scale_fill_discrete(guide = "none", direction = -1) +
+          theme(
+            axis.text.y = element_blank(),
+            panel.grid.major.y = element_blank(),
+          ) +
+          labs(
+            x = "Normalized enrichment score",
+            y = NULL,
+            title = paste0("Pathways enriched in ", x, " treatment"),
             subtitle = "FDR < 0.01"
           ) + {
             if (!any(y$sign == "neg"))
@@ -134,9 +216,9 @@ ps <- fgsea_res_single_treatments %>%
 
 pwalk(
   ps,
-  \(batch, contrast, p, ...) {
+  \(contrast_batch, p, ...) {
     ggsave(
-      file.path("plots", paste0("reactome_", batch, "_", contrast, "_bars.pdf")),
+      here("plots", "gene_set_analysis", paste0("fgsea_single_perturbation_", contrast_batch, "_no_go_bars.pdf")),
       p, width = 8, height = 8
     )
   }
@@ -205,9 +287,6 @@ fgsea_res_ptx_vs_combo <- fgsea_res_pert %>%
   ) %>%
   mutate(
     signed_padj = -sign(NES) * log10(padj)
-  ) %>%
-  filter(
-    database == "REACTOME"
   ) %>% {
     d <- .
     power_inner_join(
@@ -221,7 +300,7 @@ fgsea_res_ptx_vs_combo <- fgsea_res_pert %>%
     ) %>%
     power_inner_join(
       d,
-      by = join_by(contrast_2 == contrast, metric, database, pathway),
+      by = join_by(contrast_2 == contrast, metric, database, pathway, batch),
       suffix = c("_1", "_2"),
       check = check_specs(
         unmatched_keys_left = "warn"
@@ -245,7 +324,7 @@ sig_class_colors <- c(
 )
 
 ps <- fgsea_res_ptx_vs_combo %>%
-  group_nest(contrast_1, contrast_2) %>%
+  group_nest(batch, contrast_1, contrast_2) %>%
   mutate(
     p = pmap(
       .,
@@ -287,60 +366,19 @@ ps <- fgsea_res_ptx_vs_combo %>%
 
 pwalk(
   ps,
-  \(contrast_1, contrast_2, p, ...) {
+  \(batch, contrast_1, contrast_2, p, ...) {
     ggsave(
-      file.path("plots", paste0("reactome_", contrast_1, "_vs_", contrast_2, "_scatter_padj.pdf")),
+      here("plots", "gene_set_analysis", paste0("fgsea_single_perturbation_", contrast_1, "_vs_", contrast_2, "_", batch, "_scatter_padj.pdf")),
       p, width = 7, height = 6
     )
     htmlwidgets::saveWidget(
       ggplotly(p),
-      file.path("plots", paste0("reactome_", contrast_1, "_vs_", contrast_2, "_scatter_padj.html"))
+      here("plots", "gene_set_analysis", paste0("fgsea_single_perturbation_", contrast_1, "_vs_", contrast_2, "_", batch, "_scatter_padj.html")),
+      selfcontained = FALSE
     )
   }
 )
 
-
-ps <- fgsea_res_ptx_vs_combo %>%
-  group_nest(contrast_ptx, contrast_combo) %>%
-  mutate(
-    p = map2(
-      contrast_combo, data,
-      \(x, y) {
-        ggplot(
-          y %>%
-            arrange(match(sig_class, names(sig_class_colors))),
-          aes(
-            x = NES_ptx,
-            y = NES_combo
-          )
-        ) +
-        geom_point(
-          aes(
-            color = sig_class,
-            text = pathway
-          ),
-          alpha = .8
-        ) +
-        scale_color_manual(
-          values = sig_class_colors
-        )
-      }
-    )
-  )
-
-pwalk(
-  ps,
-  \(contrast_ptx, contrast_combo, p, ...) {
-    ggsave(
-      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter.pdf")),
-      p, width = 6, height = 6
-    )
-    htmlwidgets::saveWidget(
-      ggplotly(p),
-      file.path("plots", paste0("reactome_", contrast_ptx, "_vs_", contrast_combo, "_scatter.html"))
-    )
-  }
-)
 ```
 
 ### Highlighting certain pathways
@@ -523,6 +561,19 @@ cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
   reorder(clust, dist_mat, method = "OLO")
 }
 
+cluster_fun_binary <- function(mat, sample_in_col = TRUE) {
+  # Convert logical/character to binary if needed
+  if (is.logical(mat) || all(mat %in% c("TRUE", "FALSE", TRUE, FALSE))) {
+    mat <- matrix(as.logical(mat), nrow = nrow(mat), ncol = ncol(mat))
+    mat <- mat * 1  # Convert to 0/1
+  }
+  # Use binary distance (Jaccard is good for binary data)
+  # method = "binary" uses Jaccard distance for binary data
+  dist_mat <- dist(mat, method = "binary")
+  clust <- hclust(dist_mat, method = "average")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
 ```
 
 ```{r}
@@ -534,28 +585,27 @@ fgsea_hm_conditions <- c(
 fgsea_res_pert_hm_data <- fgsea_res_pert %>%
   filter(
     metric == "signed_padj",
-    contrast %in% fgsea_hm_conditions
-  ) %>%
-  separate_wider_delim(
-    pathway,
-    delim = "_",
-    names = c("database", "pathway"),
-    too_many = "merge"
+    contrast %in% fgsea_hm_conditions,
+    !(contrast == "PTX" & batch == "batch_2"),
+    batch != "batch_1_riki"
   ) %>%
   mutate(
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway),
+    contrast_batch = paste(contrast, recode_batch(batch)),
     signed_padj = -sign(NES) * log10(padj)
   ) %>%
   filter(
-    database == "REACTOME"
+    !str_starts(database, coll("GO"))
   ) %>%
   cluster_df(
-    pathway, contrast, signed_padj, values_fill = 0
+    pathway, contrast_batch, signed_padj, values_fill = 0
   )
 
 fgsea_res_pert_mat <- fgsea_res_pert_hm_data %>%
-  arrange(pathway, contrast) %>%
-  select(pathway, contrast, signed_padj) %>%
-  pivot_wider(names_from = contrast, values_from = signed_padj, values_fill = 0) %>%
+  arrange(pathway, contrast_batch) %>%
+  select(pathway, contrast_batch, signed_padj) %>%
+  pivot_wider(names_from = contrast_batch, values_from = signed_padj, values_fill = 0) %>%
   column_to_rownames("pathway") %>%
   as.matrix()
 
@@ -570,7 +620,7 @@ fgsea_res_pert_hm_pathways <- fgsea_res_pert_hm_data %>%
 
 ```{r}
 row_clust <- cluster_fun_eucl(
-  fgsea_res_pert_mat[as.character(fgsea_res_pert_hm_pathways), fgsea_hm_conditions]
+  fgsea_res_pert_mat[as.character(fgsea_res_pert_hm_pathways), ]
 )
 
 row_clust_df_long <- tibble(k = 4:10) %>%
@@ -605,8 +655,13 @@ write_csv(
 
 ```{r}
 library(ComplexHeatmap)
+
+hm_contrast_batch_order <- fgsea_res_pert_hm_data %>%
+  distinct(batch, contrast = factor(contrast, levels = fgsea_hm_conditions), contrast_batch) %>%
+  arrange(contrast, batch)
+
 hm <- Heatmap(
-  fgsea_res_pert_mat[as.character(fgsea_res_pert_hm_pathways), fgsea_hm_conditions],
+  fgsea_res_pert_mat[as.character(fgsea_res_pert_hm_pathways), hm_contrast_batch_order$contrast_batch],
   cluster_rows = cluster_fun_eucl,
   cluster_columns = FALSE,
   show_row_names = FALSE,
@@ -648,7 +703,7 @@ fgsea_picked_to_highlight <- c(
   "MEMBRANE_TRAFFICKING"
 )
 
-mat <- fgsea_res_pert_mat[as.character(fgsea_res_pert_hm_pathways), fgsea_hm_conditions]
+mat <- fgsea_res_pert_mat[as.character(fgsea_res_pert_hm_pathways), hm_contrast_batch_order$contrast_batch]
 mat_max_abs <- max(abs(quantile(mat, c(.025, .975), na.rm = TRUE)))
 hm <- Heatmap(
   mat,
@@ -687,7 +742,7 @@ hm <- Heatmap(
 )
 
 withr::with_pdf(
-  here("plots", "reactome_pert_heatmap_k8.pdf"),
+  here("plots", "gene_set_analysis", "fgsea_single_perturbation_heatmap_nes_k8.pdf"),
   draw(hm),
   width = 6, height = 8
 )
@@ -929,22 +984,21 @@ all_msigdbr <- msigdbr()
 
 msigdbr_of_interest <- all_msigdbr %>%
   filter(
-    gs_cat == "H" |
-    gs_subcat %in% c(
-      "CP:PID",
-      "CP:KEGG",
-      "CP:REACTOME"
-      # "GO:BP",
-      # "GO:MF"
-    ),
-    ensembl_gene %in% feasible_genes$gene_id
+    gs_collection %in% c("H") |
+      gs_subcollection %in% c(
+        "CP:PID",
+        "CP:REACTOME",
+        "CP:KEGG_MEDICUS",
+        "GO:BP",
+        "GO:MF",
+        "GO:CC"
+      ),
+    !str_detect(gs_name, coll("MEDICUS_PATHOGEN")),
+    !str_detect(gs_name, coll("MEDICUS_VARIANT"))
   ) %>%
-  separate_wider_delim(
-    gs_name,
-    delim = "_",
-    names = c("database", "pathway"),
-    too_many = "merge",
-    cols_remove = FALSE
+  mutate(
+    database = str_extract(gs_name, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(gs_name)
   )
 
 msigdbr_of_interest_mat <- msigdbr_of_interest %>%
@@ -960,13 +1014,19 @@ msigdbr_of_interest_mat <- msigdbr_of_interest %>%
 
 msigdbr_of_interest_sim <- msigdbr_of_interest_mat %>%
   proxy::dist(method = "Jaccard", by_rows = FALSE)
+
+qsave(
+  msigdbr_of_interest_sim,
+  here("results", "msigdbr_of_interest_jaccard_sim.qs")
+)
 ```
 
 
 ```{r}
 fgsea_hm_conditions <- c(
   "PTX", "GNE-495", "JNK-inh",
-  "GNE-495 + PTX", "JNK-inh + PTX"
+  "GNE-495 + PTX", "JNK-inh + PTX",
+  "GNE-495 + PTX vs PTX", "JNK-inh + PTX vs PTX"
 )
 
 de_pert_hm_data <- de_long_selected %>%
@@ -974,64 +1034,77 @@ de_pert_hm_data <- de_long_selected %>%
     contrast %in% fgsea_hm_conditions
   ) %>%
   mutate(
-    signed_padj = -sign(logFC) * log10(FDR_min_zero)
+    signed_padj = -sign(logFC) * log10(FDR_min_zero),
+    contrast_batch = paste(contrast, recode_batch(batch))
   )
+
+fgsea_hm_order <- de_pert_hm_data %>%
+  distinct(
+    batch,
+    contrast = factor(contrast, levels = fgsea_hm_conditions),
+    contrast_batch
+  ) %>%
+  arrange(contrast, batch)
 
 gene_id_gene_symbol_map <- de_pert_hm_data %>%
   distinct(gene_id, gene_name) %>%
   {with(., set_names(gene_name, gene_id))}
 
-plot_pathway_heatmap <- function(pathway) {
+plot_pathway_heatmap <- function(pathway, value_col = signed_padj) {
   gene_sets <- msigdbr_of_interest %>%
-    filter(pathway == !!pathway) %>%
+    filter(.data$pathway == .env$pathway) %>%
     pull(ensembl_gene) %>%
     unique()
 
   de_mat <- de_pert_hm_data %>%
     filter(gene_id %in% gene_sets) %>%
-    select(gene_id, contrast, logFC) %>%
-    pivot_wider(names_from = contrast, values_from = logFC, values_fill = 0) %>%
+    select(gene_id, contrast_batch, {{value_col}}) %>%
+    pivot_wider(names_from = contrast_batch, values_from = {{value_col}}, values_fill = 0) %>%
     column_to_rownames("gene_id") %>%
     as.matrix() %>% {
-      .[, fgsea_hm_conditions]
+      .[, fgsea_hm_order$contrast_batch]
     }
 
-  row_meta <- fgsea_res_rescue_data %>%
-    filter(pathway == !!pathway) %>%
-    select(compound, gene_id = leadingEdge) %>%
-    unchop(gene_id) %>%
-    mutate(
-      gene_id = factor(gene_id, levels = rownames(de_mat)),
-      decoy = 1L
-    ) %>%
-    pivot_wider(
-      names_from = compound, values_from = decoy,
-      names_prefix = "leading_edge_",
-      id_expand = TRUE, values_fill = 0L
-    ) %>%
-    column_to_rownames("gene_id") %>% {
-      .[rownames(de_mat), ]
-    }
+  # row_meta <- fgsea_res_pert %>%
+  #   filter(
+  #     pathway == !!pathway,
+  #     metric == "signed_padj"
+  #   ) %>%
+  #   select(compound, gene_id = leadingEdge) %>%
+  #   unchop(gene_id) %>%
+  #   mutate(
+  #     gene_id = factor(gene_id, levels = rownames(de_mat)),
+  #     decoy = 1L
+  #   ) %>%
+  #   pivot_wider(
+  #     names_from = compound, values_from = decoy,
+  #     names_prefix = "leading_edge_",
+  #     id_expand = TRUE, values_fill = 0L
+  #   ) %>%
+  #   column_to_rownames("gene_id") %>% {
+  #     .[rownames(de_mat), ]
+  #   }
 
   mat_max_abs <- max(abs(quantile(de_mat, c(.025, .975), na.rm = TRUE)))
 
   hm <- Heatmap(
     de_mat,
-    name = "log2 fold change",
+    name = "Signed -log10 FDR",
     col = circlize::colorRamp2(seq(from = -mat_max_abs, to = mat_max_abs, length.out = 51), paletteer::paletteer_c("pals::ocean.balance", n = 51)),
     cluster_rows = cluster_fun_eucl,
     cluster_columns = FALSE,
+    column_split = fgsea_hm_order$contrast,
     row_labels = gene_id_gene_symbol_map[rownames(de_mat)],
-    right_annotation = HeatmapAnnotation(
-      df = row_meta,
-      which = "row"
-    )
+    # right_annotation = HeatmapAnnotation(
+    #   df = row_meta,
+    #   which = "row"
+    # )
   )
 
   return(hm)
 }
 
-plot_pathway_heatmap("METABOLISM_OF_LIPIDS")
+plot_pathway_heatmap("R_P38MAPK_EVENTS")
 
 library(ComplexHeatmap)
 de_pert_rescue_hm_data <- tibble(
@@ -1141,38 +1214,36 @@ bar_plot_colors <- c(
 )
 
 fgsea_overrep_data <- fgsea_overrep %>%
-  separate_wider_delim(
-    pathway,
-    delim = "_",
-    names = c("database", "pathway"),
-    too_many = "merge"
+  mutate(
+    compound_batch = paste(compound, recode_batch(batch)),
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway)
   ) %>%
   mutate(
     # sign = if_else(NES > 0, "pos", "neg"),
-    signed_padj = -if_else(perturbed == "up", 1, -1) * log10(padj_fgsea),
-    pathway_db = paste(str_sub(database, 1, 1), pathway, sep = "_"),
-    pathway_db_direction = paste(perturbed, pathway_db, sep = "_")
+    signed_padj = -if_else(perturbed == "up", 1, -1) * log10(padj),
+    pathway_direction = paste(perturbed, pathway, sep = "_")
   )
 
 ps <- fgsea_overrep_data %>%
   group_nest(
-    compound, rescue_definition
+    perturbed_threshold, compound_batch, rescue_definition
   ) %>%
   mutate(
     p = pmap(
-      list(compound, data, rescue_definition),
+      list(compound_batch, data, rescue_definition),
       \(x, y, z) {
         y %>%
           filter(
-            padj_fgsea < .01
+            padj < .01
           ) %>%
           mutate(
-            across(pathway_db_direction, \(x) fct_reorder(x, signed_padj))
+            across(pathway_direction, \(x) fct_reorder(x, signed_padj))
           ) %>%
           ggplot(
             aes(
               x = signed_padj,
-              y = pathway_db_direction,
+              y = pathway_direction,
               fill = perturbed
             )
           ) +
@@ -1181,7 +1252,7 @@ ps <- fgsea_overrep_data %>%
             aes(
               x = if_else(perturbed == "up", -.05, .05),
               hjust = if_else(perturbed == "up", 1, 0),
-              label = pathway_db
+              label = pathway
             ),
             size = 2
           ) +
@@ -1209,11 +1280,11 @@ dir.create(
 
 pwalk(
   ps,
-  \(compound, p, rescue_definition, ...) {
+  \(compound_batch, p, rescue_definition, perturbed_threshold, ...) {
     n <- nrow(layer_data(p))
-    h <- 2 + .1 * n
+    h <- pmin(49, 2 + .1 * n)
     ggsave(
-      file.path("plots", "overrep", paste0("overrep_", rescue_definition, "_", compound, "_bars.pdf")),
+      here("plots", "gene_set_analysis", paste0("fgsea_single_rescue_", rescue_definition, "_", perturbed_threshold, "_", compound_batch, "_bars.pdf")),
       p, width = 8, height = h
     )
   }
@@ -1228,14 +1299,15 @@ fgsea_overrep_vs_ptx_pert <- fgsea_overrep %>%
   filter(
     rescue_definition != "perturbed"
   ) %>%
-  separate_wider_delim(
-    pathway,
-    delim = "_",
-    names = c("database", "pathway"),
-    too_many = "merge"
+  mutate(
+    compound_batch = paste(compound, recode_batch(batch)),
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway)
   ) %>%
   mutate(
-    signed_padj = -if_else(perturbed == "up", 1, -1) * log10(padj)
+    # sign = if_else(NES > 0, "pos", "neg"),
+    signed_padj = -if_else(perturbed == "up", 1, -1) * log10(padj),
+    pathway_direction = paste(perturbed, pathway, sep = "_")
   ) %>%
   power_inner_join(
     fgsea_res_single_treatments %>%
@@ -1243,30 +1315,51 @@ fgsea_overrep_vs_ptx_pert <- fgsea_overrep %>%
       mutate(
         signed_padj = -if_else(NES > 0, 1, -1) * log10(padj)
       ),
-    by = c("database", "pathway"),
+    by = c("database", "pathway", "batch"),
     suffix = c("_overrep", "_PTX"),
     check = check_specs(
-      unmatched_keys_left = "warn",
+      unmatched_keys_left = "info",
       unmatched_keys_right = "warn",
       duplicate_keys_right = "warn"
     )
   )
 
-p <- fgsea_overrep_vs_ptx_pert %>%
-  ggplot(
-    aes(
-      x = signed_padj_PTX,
-      y = signed_padj_overrep
+ps <- fgsea_overrep_vs_ptx_pert %>%
+  group_nest(
+    rescue_definition, perturbed_threshold
+  ) %>%
+  mutate(
+    p = map(
+      data,
+      \(d) {
+        ggplot(
+          d,
+          aes(
+            x = signed_padj_PTX,
+            y = signed_padj_overrep
+          )
+        ) +
+        geom_point(
+          aes(
+            text = pathway
+          )
+        ) +
+        facet_grid(
+          vars(compound), vars(batch)
+        )
+      }
     )
-  ) +
-  geom_point(
-    aes(
-      text = pathway
-    )
-  ) +
-  facet_grid(
-   vars(compound), vars(rescue_definition)
   )
+
+pwalk(
+  ps,
+  \(rescue_definition, perturbed_threshold, p, ...) {
+    ggsave(
+      here("plots", "gene_set_analysis", paste0("fgsea_rescue_overrep_vs_ptx_fgsea_", rescue_definition, "_", perturbed_threshold, ".pdf")),
+      p, width = 10, height = 8
+    )
+  }
+)
 
 htmlwidgets::saveWidget(
   ggplotly(p),
@@ -1282,55 +1375,46 @@ Have to be careful about perturbed `both_up_down` class, messes up signed_padj
 
 ```{r}
 fgsea_intersection_overrep_data <- fgsea_intersection_overrep %>%
-  separate_wider_delim(
-    pathway,
-    delim = "_",
-    names = c("database", "pathway"),
-    too_many = "merge"
+  mutate(
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway)
   ) %>%
   mutate(
     # sign = if_else(NES > 0, "pos", "neg"),
-    signed_padj = -if_else(perturbed %in% c("both_up_down", "up"), 1, -1) * log10(padj_fgsea),
-    pathway_db = paste(str_sub(database, 1, 1), pathway, sep = "_"),
-    pathway_db_direction = paste(perturbed, pathway_db, sep = "_")
+    signed_padj = -if_else(perturbed == "up", 1, -1) * log10(padj),
+    pathway_direction = paste(perturbed, pathway, sep = "_")
   )
-
-fgsea_intersection_overrep_data %>%
-  filter(
-    rescue_definition == "significant_opposite",
-    pathway == "SRP_DEPENDENT_COTRANSLATIONAL_PROTEIN_TARGETING_TO_MEMBRANE"
-  ) %>%
-  View()
 
 ps <- fgsea_intersection_overrep_data %>%
   filter(perturbed %in% c("up", "down")) %>%
   group_nest(
-    batch, rescue_type, rescue_definition
+    perturbed_threshold, batch, rescue_type, rescue_definition
   ) %>%
   mutate(
     p = pmap(
       list(rescue_type, rescue_definition, data),
       \(x, y, z) {
-        z %>%
+        d <- z %>%
           filter(
-            padj_fgsea < .01
+            padj < .01
           ) %>%
           mutate(
-            across(pathway_db_direction, \(x) fct_reorder(x, signed_padj))
-          ) %>%
-          ggplot(
-            aes(
-              x = signed_padj,
-              y = pathway_db_direction,
-              fill = perturbed
-            )
-          ) +
+            across(pathway_direction, \(x) fct_reorder(x, signed_padj))
+          )
+        ggplot(
+          d,
+          aes(
+            x = signed_padj,
+            y = pathway_direction,
+            fill = perturbed
+          )
+        ) +
           geom_col() +
           geom_text(
             aes(
               x = if_else(perturbed == "up", -.05, .05),
               hjust = if_else(perturbed == "up", 1, 0),
-              label = pathway_db
+              label = pathway
             ),
             size = 2
           ) +
@@ -1340,7 +1424,10 @@ ps <- fgsea_intersection_overrep_data %>%
           theme(
             axis.text.y = element_blank(),
             panel.grid.major.y = element_blank(),
-          ) +
+          ) + {
+            if (!any(d$perturbed == "down"))
+              lims(x = c(-max(abs(d$signed_padj)), NA))
+          } +
           labs(
             x = "Signed adjusted p-value",
             y = NULL,
@@ -1351,21 +1438,15 @@ ps <- fgsea_intersection_overrep_data %>%
     )
   )
 
-dir.create(
-  here("plots", "overrep"),
-  showWarnings = FALSE
-)
-
 pwalk(
   ps,
-  \(batch, rescue_definition, rescue_type, p, ...) {
+  \(perturbed_threshold, batch, rescue_definition, rescue_type, p, ...) {
     ggsave(
-      file.path("plots", "overrep", paste0("overrep_intersection_", batch, "_", rescue_definition, "_", rescue_type, "_bars.pdf")),
-      p, width = 8, height = 8
+      here("plots", "gene_set_analysis", paste0("fgsea_rescue_overrep_bars_", rescue_definition, "_", rescue_type, "_", batch, "_", perturbed_threshold, ".pdf")),
+      p, width = 10, height = 8
     )
   }
 )
-
 ```
 
 ### Dot plot
@@ -1375,11 +1456,12 @@ pwalk(
 
 fgsea_intersection_dotplot_data <- fgsea_intersection_overrep_data %>%
   mutate(
-    padj_fgsea_bin = cut(
-      padj_fgsea,
+    padj_bin = cut(
+      padj,
       breaks = c(0, .01, .05, 1),
       labels = c("FDR < 0.01", "0.01 < FDR < 0.05", "ns")
-    )
+    ),
+    estimate = log2(foldEnrichment)
   ) %>%
   filter(
     rescue_type %in% c("GNE-495 only", "JNK-inh only"),
@@ -1393,7 +1475,7 @@ fgsea_intersection_dotplot_data <- fgsea_intersection_overrep_data %>%
   #   directed_estimate = if_else(direction == "up", estimate, -estimate)
   # ) %>%
   group_nest(
-    batch, rescue_definition
+    perturbed_threshold, batch, rescue_definition
   ) %>%
   mutate(
     p = map(
@@ -1401,15 +1483,15 @@ fgsea_intersection_dotplot_data <- fgsea_intersection_overrep_data %>%
       \(x) {
         d <- group_by(
           x,
-          pathway_db
+          pathway
         ) %>%
           filter(
-            any(padj_fgsea < .01)
+            any(padj < .01)
           ) %>%
           ungroup()
         dmats <- d %>%
-          select(rescue_type, pathway_db, perturbed, estimate) %>%
-          arrange(pathway_db) %>%
+          select(rescue_type, pathway, perturbed, estimate) %>%
+          arrange(pathway) %>%
           split(.$perturbed) %>%
           map(
             \(y) select(y, -perturbed) %>%
@@ -1417,24 +1499,25 @@ fgsea_intersection_dotplot_data <- fgsea_intersection_overrep_data %>%
                 names_from = rescue_type,
                 values_from = estimate
               ) %>%
-              column_to_rownames("pathway_db") %>%
+              column_to_rownames("pathway") %>%
               as.matrix() %>%
               dist()
           )
         dmat <- reduce(dmats, `+`)
+        browser()
         clust <- hclust(dmat, method = "average") %>%
           reorder(dmat, method = "OLO")
         # browser()
         ggplot(
           d %>%
             mutate(
-              pathway_db = factor(pathway_db, levels = clust$labels[clust$order])
+              pathway = factor(pathway, levels = clust$labels[clust$order])
             ),
           aes(
             x = rescue_type,
-            y = pathway_db,
+            y = pathway,
             color = estimate,
-            size = padj_fgsea_bin
+            size = padj_bin
           )
         ) +
           geom_point(shape = 16) +
@@ -1538,18 +1621,22 @@ fgsea_intersection_overrep_data_single <- fgsea_intersection_overrep_data %>%
   filter(
     perturbed %in% c("up", "down")
   ) %>%
+  mutate(
+    # Replacing -Inf with -1 for log2 fold enrichment
+    estimate = log2(if_else(foldEnrichment == 0, .5, foldEnrichment))
+  ) %>%
   group_by(
-    batch, rescue_definition, rescue_type, database, pathway_db, pathway
+    perturbed_threshold, batch, rescue_definition, rescue_type, database, pathway
   ) %>%
   summarize(
     direction = case_when(
-      all(padj_fgsea >= .01) ~ "none",
-      padj_fgsea[1] < .2 * padj_fgsea[2] | padj_fgsea[2] < .2 * padj_fgsea[1] ~ perturbed[which.min(padj_fgsea)],
+      all(padj >= .01) ~ "none",
+      padj[1] < .2 * padj[2] | padj[2] < .2 * padj[1] ~ perturbed[which.min(padj)],
       TRUE ~ "both"
     ),
-    estimate = estimate[order(padj_fgsea)[1]],
-    padj_fgsea = min(padj_fgsea),
-    # estimate = estimate[which.min(padj_fgsea)],
+    estimate = estimate[order(padj)[1]],
+    padj = min(padj),
+    # estimate = estimate[which.min(padj)],
     .groups = "drop"
   )
 
@@ -1561,8 +1648,8 @@ fgsea_blacklist <- c(
 
 fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single %>%
   mutate(
-    padj_fgsea_bin = cut(
-      padj_fgsea,
+    padj_bin = cut(
+      padj,
       breaks = c(0, .001, .01, 1),
       labels = c("FDR < 0.001", "FDR < 0.01", "ns")
     ),
@@ -1575,14 +1662,15 @@ fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single
     # )
   ) %>%
   filter(
-    !database %in% c("KEGG"),
+    !database %in% c("KEGG", "GOBP", "GOMF", "GOCC"),
     rescue_type %in% c("GNE-495 only", "JNK-inh only"),
   ) %>%
   mutate(
-    directed_estimate = if_else(direction == "up", estimate, -estimate)
+    directed_estimate = if_else(direction == "up", estimate, -estimate),
+    rescute_type_batch = paste(rescue_type, recode_batch(batch), sep = "_")
   ) %>%
   group_nest(
-    batch, rescue_definition
+    perturbed_threshold, rescue_definition
   ) %>%
   crossing(
     p_threshold = c(0.005, 0.001, .01)
@@ -1594,21 +1682,21 @@ fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single
         # browser()
         d <- group_by(
           x,
-          pathway_db
+          pathway
         ) %>%
           filter(
-            any(padj_fgsea < y)
+            any(padj < y)
           ) %>%
           ungroup()
         dwide <- d %>%
-          select(rescue_type, pathway_db, directed_estimate) %>%
-          arrange(pathway_db) %>%
+          select(rescute_type_batch, pathway, directed_estimate) %>%
+          arrange(pathway) %>%
           pivot_wider(
-            names_from = rescue_type,
+            names_from = rescute_type_batch,
             values_from = directed_estimate
           )
         dmat <- dwide %>%
-          column_to_rownames("pathway_db") %>%
+          column_to_rownames("pathway") %>%
           as.matrix() %>%
           dist()
         # browser()
@@ -1621,25 +1709,25 @@ fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single
             .
           )
         }
-        sim_hm <- msigdbr_of_interest_sim_trans[
-          rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
-        ] %>%
-          pheatmap(
-            cluster_rows = FALSE,
-            cluster_cols = FALSE
-          )
+        # sim_hm <- msigdbr_of_interest_sim_trans[
+        #   rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
+        # ] %>%
+        #   pheatmap(
+        #     cluster_rows = FALSE,
+        #     cluster_cols = FALSE
+        #   )
         est_perc <- quantile(d$directed_estimate, c(.05, .95))
         abs_max_est_perc <- max(abs(est_perc))
         p <- ggplot(
           d %>%
             mutate(
-              pathway_db = factor(pathway_db, levels = clust$labels[clust$order])
+              pathway = factor(pathway, levels = clust$labels[clust$order])
             ),
           aes(
-            x = rescue_type,
-            y = pathway_db,
+            x = rescute_type_batch,
+            y = pathway,
             color = directed_estimate,
-            size = padj_fgsea_bin
+            size = padj_bin
           )
         ) +
           geom_point(shape = 16) +
@@ -1672,8 +1760,8 @@ fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single
             size = NULL
           )
         list(
-          p = p,
-          sim_hm = sim_hm
+          p = p
+          # sim_hm = sim_hm
         ) %>%
           map(list)
       }
@@ -1688,16 +1776,160 @@ flag_similar_adjacent_leaves(clust, msigdbr_of_interest_sim_trans, .6)
 
 pwalk(
   fgsea_intersection_dotplot_data_single,
-  \(p, rescue_definition, p_threshold, sim_hm, ...) {
+  \(p, rescue_definition, p_threshold, perturbed_threshold, ...) {
     ggsave(
-      file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, ".pdf")),
+      here("plots", "gene_set_analysis", paste0("fgsea_rescue_overrep_dotplot_", rescue_definition, "_", perturbed_threshold, "_", p_threshold, ".pdf")),
       p[[1]], width = 9.8, height = 9
     )
-    withr::with_pdf(
-      file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, "_similarity.pdf")),
-      draw(sim_hm[[1]]),
-      width = 9.8, height = 9
+    # withr::with_pdf(
+    #   file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, "_similarity.pdf")),
+    #   draw(sim_hm[[1]]),
+    #   width = 9.8, height = 9
+    # )
+  }
+)
+
+
+fgsea_intersection_dotplot_data_single <- fgsea_intersection_overrep_data_single %>%
+  mutate(
+    padj_bin = cut(
+      padj,
+      breaks = c(0, .01, .05, 1),
+      labels = c("FDR < 0.01", "FDR < 0.05", "ns")
+    ),
+    # across(
+    #   pathway_db,
+    #   \(x) str_remove_all(
+    #     x, coll("_")
+    #   ) %>%
+    #     str_sub(start = 3)
+    # )
+  ) %>%
+  filter(
+    !database %in% c("KEGG", "GOBP", "GOMF", "GOCC"),
+    rescue_type %in% c("GNE-495 only", "JNK-inh only"),,
+    batch != "batch_1_riki"
+  ) %>%
+  mutate(
+    directed_estimate = if_else(direction == "up", estimate, -estimate),
+    rescute_type_batch = paste(rescue_type, recode_batch(batch), sep = "_")
+  ) %>%
+  group_nest(
+    perturbed_threshold, rescue_definition
+  ) %>%
+  crossing(
+    p_threshold = c(0.005, 0.001, .01)
+  ) %>%
+  mutate(
+    res = map2(
+      data, p_threshold,
+      possibly(\(x, y) {
+        # browser()
+        d <- group_by(
+          x,
+          pathway
+        ) %>%
+          filter(
+            any(padj < y)
+          ) %>%
+          ungroup()
+        dwide <- d %>%
+          select(rescute_type_batch, pathway, directed_estimate) %>%
+          arrange(pathway) %>%
+          pivot_wider(
+            names_from = rescute_type_batch,
+            values_from = directed_estimate
+          )
+        dmat <- dwide %>%
+          column_to_rownames("pathway") %>%
+          as.matrix() %>%
+          dist()
+        # browser()
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        row_labels <- clust$labels[clust$order] %>% {
+          set_names(
+            str_replace_all(., coll("_"), " ") %>%
+              str_sub(start = 2),
+            .
+          )
+        }
+        # sim_hm <- msigdbr_of_interest_sim_trans[
+        #   rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
+        # ] %>%
+        #   pheatmap(
+        #     cluster_rows = FALSE,
+        #     cluster_cols = FALSE
+        #   )
+        est_perc <- quantile(d$directed_estimate, c(.05, .95))
+        abs_max_est_perc <- max(abs(est_perc))
+        p <- ggplot(
+          d %>%
+            mutate(
+              pathway = factor(pathway, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = rescute_type_batch,
+            y = pathway,
+            color = directed_estimate,
+            size = padj_bin
+          )
+        ) +
+          geom_point(shape = 16) +
+          # scale_color_viridis_c(trans = "pseudo_log") +
+          # scale_color_distiller(
+          #   limits = c(-abs_max_est_perc, abs_max_est_perc),
+          #   palette = "RdYlBu", trans = "pseudo_log",
+          #   oob = scales::squish
+          # ) +
+          paletteer::scale_color_paletteer_c(
+            palette = "pals::ocean.balance",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish
+          ) +
+          scale_size_manual(
+            values = rev(c("FDR < 0.01" = 6, "FDR < 0.05" = 4, "ns" = 2))
+          ) +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(
+            breaks = names(row_labels),
+            labels = unname(row_labels)
+          ) +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 0)
+          ) +
+          labs(
+            x = "Rescue by",
+            y = NULL,
+            color = "Rescue of\ngenes",
+            size = NULL
+          )
+        list(
+          p = p
+          # sim_hm = sim_hm
+        ) %>%
+          map(list)
+      })
     )
+  ) %>%
+  select(-data) %>%
+  unnest_wider(
+    res
+  )
+
+pwalk(
+  fgsea_intersection_dotplot_data_single %>%
+    filter(map_lgl(p, \(x) !is.null(x))),
+  \(p, rescue_definition, p_threshold, perturbed_threshold, ...) {
+    ggsave(
+      here("plots", "gene_set_analysis", paste0("fgsea_rescue_overrep_dotplot_batch1_2_", rescue_definition, "_", perturbed_threshold, "_", p_threshold, ".pdf")),
+      p[[1]], width = 9.8, height = 9
+    )
+    # withr::with_pdf(
+    #   file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, "_similarity.pdf")),
+    #   draw(sim_hm[[1]]),
+    #   width = 9.8, height = 9
+    # )
   }
 )
  ```
@@ -2631,3 +2863,69 @@ hm
 VX-702
 DORAMAPIMOD
 LOSMAPIMOD
+
+## Visualize overlap between rescue type lists
+
+```{r}
+ptx_rescue_overlap <- ptx_rescue_types %>%
+  filter(
+    rescue_type %in% c("GNE-495 only", "JNK-inh only", "both")
+  ) %>%
+  mutate(
+    # rescue_type_direction = paste(
+    #   rescue_type, perturbed
+    # ),
+    dummy = TRUE,
+    across(batch, recode_batch)
+  ) %>%
+  select(-c(`GNE-495`, `JNK-inh`, perturbed)) %>%
+  pivot_wider(
+    names_from = c(rescue_type, batch),
+    values_from = dummy,
+    values_fill = list(dummy = FALSE)
+  )
+
+ptx_rescue_overlap_hm <- ptx_rescue_overlap %>%
+  group_nest(
+    perturbed_threshold, rescue_definition
+  ) %>%
+  mutate(
+    hm = map(
+      data,
+      \(x) {
+        mat <- x %>%
+          # mutate(across(-gene_id, \(y) if_else(y, "TRUE", "FALSE"))) %>%
+          column_to_rownames("gene_id") %>%
+          as.matrix()
+        # browser()
+        Heatmap(
+          mat * 1L,
+          name = "Rescue",
+          col = c(`0` = "white", `1` = "blue"),
+          # cluster_rows = cluster_fun_binary,
+          # cluster_columns = cluster_fun_binary,
+          clustering_distance_rows = "binary",
+          clustering_distance_columns = "binary",
+          show_row_names = FALSE
+        )
+      }
+    )
+  )
+
+pwalk(
+  ptx_rescue_overlap_hm,
+  \(perturbed_threshold, rescue_definition, hm, ...) {
+    withr::with_pdf(
+      file.path("plots", paste0("ptx_rescue_gene_set_overlap_hm_", rescue_definition, "_", perturbed_threshold, ".pdf")),
+      draw(hm),
+      width = 6, height = 10
+    )
+  }
+)
+```
+
+TODO:
+1. Heatmap of logFC all DE genes, including JNK+GNE double/triple treatments
+2. Dot plot of PTX, GNE vs DMSO, JNK vs DMOS, double treatments vs PTX (FGSEA enrichments)
+3. Scatter plots of FGSEA enrichments, highlighting interesting ones, labelling quadrants
+4. PCAs and volcano plo

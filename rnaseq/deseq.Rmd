@@ -107,6 +107,12 @@ meta_raw <- syn("syn69962755") %>%
     across(
       c(ptx, gne_495, jnk_in, gne_495_3, jnk_in_3, gne_495_1, jnk_in_1),
       \(x) factor(x, levels = c("no", "yes"))
+    ),
+    condition_simple = paste(
+      "PTX", ptx,
+      "GNE", gne_combined,
+      "JNK", jnk_combined,
+      sep = "_"
     )
   )
 
@@ -225,9 +231,13 @@ normMat <- log10(normMat)
 
 de_design_combined_no_batch <- ~ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3
 de_design_combined <- ~batch + sequencing_batch + ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3
+de_design_condition_simple_no_batch <- ~condition_simple
+de_design_condition_simple <- ~batch + sequencing_batch + condition_simple
 
 mm_no_batch <- model.matrix(de_design_combined_no_batch, data = meta_raw)
 mm <- model.matrix(de_design_combined, data = meta_raw)
+mm_condition_simple_no_batch <- model.matrix(de_design_condition_simple_no_batch, data = meta_raw)
+mm_condition_simple <- model.matrix(de_design_condition_simple, data = meta_raw)
 
 count_mat_edger <- DGEList(raw_salmon_combined$counts) |>
   scaleOffset(normMat)
@@ -256,6 +266,11 @@ ruvk5 <- RUVr(
 
 ruvk5_meta <- pData(ruvk5) %>%
   as_tibble(rownames = "sample_id_sequencing")
+
+write_csv(
+  ruvk5_meta,
+  here("rnaseq", "ruv_k5_meta_no_batch.csv.gz")
+)
 
 ruvk5_w_long <- ruvk5_meta |>
   select(sample_id_sequencing, starts_with("W_")) |>
@@ -319,7 +334,6 @@ ggsave(
   p, width = 8, height = 6
 )
 ```
-
 
 ### Normalization considering batch effects explicitly
 
@@ -401,10 +415,15 @@ ggsave(
 ```
 
 
-## Derive normalized counts
+```{r}
 
 
-### Batch correct counts
+```
+
+## DESeq2 analysis
+
+
+### Derived normalized and batch corrected counts
 
 Here purposefully using all genes, not just feasible so they appear
 in the VST count table if we need them
@@ -500,6 +519,9 @@ ggsave(
   p, width = 8, height = 4
 )
 ```
+
+
+### PCA
 
 
 ```{r}
@@ -647,8 +669,8 @@ ggsave(
 )
 ```
 
-```
 
+### EMM analysis
 
 ```{r}
 lrt_res <- results(de_batch2_reduced, tidy = TRUE) %>%
@@ -776,6 +798,170 @@ write_csv(
   res_emm_long,
   here("rnaseq", "batch2_deseq2_emm_results.csv.gz")
 )
+# res_emm_long <- read_csv(
+#   here("rnaseq", "batch2_deseq2_emm_results.csv.gz")
+# )
+```
+
+
+## DESeq2 using RUVk normalization
+
+
+```{r}
+
+de_combined_ruv <- DESeqDataSetFromTximport(
+  raw_salmon_combined,
+  ruvk5_meta,
+  design = ~ptx * gne_495_1 * jnk_in_1 + gne_495_3 + jnk_in_3 + ptx:gne_495_3 + ptx:jnk_in_3 + W_1 + W_2 + W_3 + W_4 + W_5,
+) %>%
+  DESeq()
+
+colnames(mm_no_batch)
+
+de_combined_ruv_simple <- DESeqDataSetFromTximport(
+  raw_salmon_combined,
+  ruvk5_meta %>%
+    mutate(
+      condition = paste(
+        "PTX", ptx,
+        "GNE", gne_combined,
+        "JNK", jnk_combined,
+        sep = "_"
+      )
+    ),
+  design = ~condition + W_1 + W_2 + W_3 + W_4 + W_5,
+) %>%
+  DESeq()
+```
+
+
+### Extract results
+
+```{r}
+
+de_combined_ruv_simple_res_raw <- tribble(
+  ~name, ~numerator, ~denominator,
+  "GNE-495", "PTX_no_GNE_{conc}_JNK_0", "PTX_no_GNE_0_JNK_0",
+  "JNK-inh", "PTX_no_GNE_0_JNK_{conc}", "PTX_no_GNE_0_JNK_0",
+  "GNE-495 + PTX", "PTX_yes_GNE_{conc}_JNK_0", "PTX_no_GNE_0_JNK_0",
+  "JNK-inh + PTX", "PTX_no_GNE_0_JNK_{conc}", "PTX_no_GNE_0_JNK_0",
+  "PTX", "PTX_yes_GNE_0_JNK_0", "PTX_no_GNE_0_JNK_0",
+  "GNE-495 + PTX vs PTX", "PTX_yes_GNE_{conc}_JNK_0", "PTX_yes_GNE_0_JNK_0",
+  "JNK-inh + PTX vs PTX", "PTX_yes_GNE_0_JNK_{conc}", "PTX_yes_GNE_0_JNK_0",
+  "GNE-495 + JNK-inh + PTX vs PTX", "PTX_yes_GNE_{conc}_JNK_{conc}", "PTX_yes_GNE_0_JNK_0",
+  "GNE-495 + JNK-inh", "PTX_no_GNE_{conc}_JNK_{conc}", "PTX_no_GNE_0_JNK_0",
+  "GNE-495 + JNK-inh + PTX vs JNK-inh + PTX", "PTX_yes_GNE_{conc}_JNK_{conc}", "PTX_yes_GNE_0_JNK_{conc}",
+  "GNE-495 + JNK-inh + PTX vs GNE-495 + PTX", "PTX_yes_GNE_{conc}_JNK_{conc}", "PTX_yes_GNE_{conc}_JNK_0"
+) %>%
+  cross_join(
+    tribble(
+      ~batch, ~conc,
+      "batch_1", "3",
+      "batch_2", "1"
+    )
+  ) %>%
+  mutate(
+    across(
+      c(numerator, denominator),
+      \(z) {
+        str_replace_all(z, fixed("{conc}"), conc)
+      }
+    ),
+    res = pmap(
+      pick(everything()),
+      \(numerator, denominator, ...) {
+        possibly(extract_deseq_result)(
+          de_combined_ruv_simple,
+          contrast = c("condition", numerator, denominator)
+        )
+      }
+    )
+  )
+
+de_combined_ruv_simple_res <- de_combined_ruv_simple_res_raw %>%
+  select(name, batch, res) %>%
+  unnest(res) %>%
+  power_left_join(
+    distinct(tx2gene, gene_id, gene_name),
+    by = "gene_id",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+
+write_csv(
+  de_combined_ruv_simple_res,
+  here("rnaseq", "combined_deseq2_ruv_only_results.csv.gz")
+)
+```
+
+### Compare RUVk vs EMM
+
+```{r}
+x_s <- extract_deseq_result(de_combined_ruv_simple, name = "condition_PTX_yes_GNE_0_JNK_0_vs_PTX_no_GNE_0_JNK_0")
+x_c <- extract_deseq_result(de_combined_ruv, name = "ptx_yes_vs_no")
+
+print(arrange(x_s, pvalue), n = 20)
+print(arrange(x_c, pvalue), n = 20)
+
+de_combined_edger_test_input <- DGEList(raw_salmon_combined$counts) |>
+  scaleOffset(normMat)
+
+mm_condition_simple_w_ruv <- model.matrix(
+  ~condition_simple + W_1 + W_2 + W_3 + W_4 + W_5,
+  data = ruvk5_meta
+)
+
+keep <- filterByExpr(de_combined_edger_test_input, mm_condition_simple_w_ruv)
+de_combined_edger_test_kept <- de_combined_edger_test_input[keep, ]
+
+de_combined_edger_test_de <- de_combined_edger_test_kept |>
+  estimateDisp(design = mm_condition_simple_w_ruv, robust = TRUE) |>
+  glmQLFit(design = mm_condition_simple_w_ruv, robust = TRUE, legacy = FALSE)
+
+x_se <- glmQLFTest(
+  de_combined_edger_test_de,
+  coef = "condition_simplePTX_yes_GNE_0_JNK_0"
+) %>%
+  topTags(n = Inf) |>
+  as.data.frame() %>%
+  as_tibble(rownames = "gene_id")
+
+print(res_emm_long %>% filter(name == "PTX") %>% arrange(pvalue), n = 20)
+
+
+x_s_vs_x_emm <- power_inner_join(
+  x_s %>%
+    mutate(
+      signed_p = -log10(padj) * sign(log2FoldChange_MLE)
+    ),
+  res_emm_long %>%
+    filter(name == "PTX") %>%
+    mutate(
+      signed_p = -log10(padj) * sign(log2FoldChange_MLE)
+    ),
+  by = "gene_id",
+  suffix = c("_ruv", "_emm"),
+  check = check_specs(
+    unmatched_keys_left = "warn",
+    unmatched_keys_right = "warn",
+    duplicate_keys_left = "warn",
+    duplicate_keys_right = "warn"
+  )
+)
+
+ggplot(
+  x_s_vs_x_emm,
+  aes(
+    x = signed_p_ruv,
+    y = signed_p_emm,
+    text = paste("Gene:", gene_name)
+  )
+) +
+  geom_point(alpha = .5) +
+  geom_abline(slope = 1, intercept = 0, color = "red")
 ```
 
 ### Heatmap LFC
@@ -1419,7 +1605,8 @@ synStoreMany(
         "combined_deseq2_emm_ruv_results.csv.gz",
         "combined_edger_emm_ruv_results.csv.gz",
         "combined_counts_all.csv.gz",
-        "meta_combined.csv.gz"
+        "meta_combined.csv.gz",
+        "combined_deseq2_ruv_only_results.csv.gz"
       )
     )
   ),
