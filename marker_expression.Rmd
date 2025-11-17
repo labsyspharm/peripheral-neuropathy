@@ -45,7 +45,30 @@ combined_counts_all <- syn("syn70780244") |>
   )
 
 meta_combined <- syn("syn70780412") |>
-  read_csv()
+  read_csv() %>%
+  mutate(
+    condition_fixed = if_else(
+      gne_combined == 0 & jnk_combined == 0 & ptx == "no",
+      "DMSO",
+      paste(
+        if_else(
+          gne_combined > 0,
+          paste0("GNE-495 (", gne_combined, "μM)"),
+          NA_character_
+        ),
+        if_else(
+          jnk_combined > 0,
+          paste0("JNK-inh (", jnk_combined, "μM)"),
+          NA_character_
+        ),
+        if_else(ptx == "yes", "PTX", NA_character_),
+        sep = " + "
+      ) %>%
+        str_remove_all("NA \\+ |\\+ NA") %>%
+        str_trim() %>%
+        factor(levels = str_sort(unique(.), numeric = TRUE))
+    )
+  )
 ```
 
 ## Reading and mapping marker genes
@@ -302,5 +325,84 @@ withr::with_pdf(
   file.path("plots", "marker_expression_baseline_vst_heatmap.pdf"),
   draw(hm),
   width = 6, height = 9
+)
+```
+
+## ATF3
+
+```{r}
+
+
+atf3_counts <- combined_counts_all |>
+  filter(
+    gene_name == "ATF3",
+    type == "vst_batch_removed"
+  ) |>
+  pivot_longer(
+    -c(type, gene_id, gene_name),
+    names_to = "sample_id_sequencing",
+    values_to = "vst_expression"
+  ) |>
+  power_inner_join(
+    meta_combined,
+    by = "sample_id_sequencing",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+
+condition_order <- meta_combined |>
+  distinct(
+    condition_fixed,
+    experiment,
+    ptx,
+    gne_combined,
+    jnk_combined
+  ) |>
+  arrange(
+    gne_combined > 0 & jnk_combined > 0,
+    gne_combined,
+    jnk_combined
+  )
+
+p <- ggplot(
+  atf3_counts %>%
+    mutate(
+      condition_fixed = factor(
+        condition_fixed,
+        levels = unique(condition_order$condition_fixed)
+      )
+    ),
+  aes(
+    x = condition_fixed,
+    y = vst_expression
+  )
+) +
+  geom_quasirandom(alpha = .5, shape = 16) +
+  geom_boxplot(fill = NA, outlier.shape = NA) +
+  paletteer::scale_color_paletteer_d(
+    "ggsci::default_jco",
+    guide = "none"
+  ) +
+  # scale_y_log10() +
+  labs(
+    x = NULL,
+    y = "Batch corrected variance stabilized count"
+  ) +
+  envalysis::theme_publish() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+p
+
+ggsave(
+  file.path("plots", "marker_expression_atf3_vst_beeswarm.pdf"),
+  p, width = 5, height = 5,
+  device = cairo_pdf
 )
 ```
