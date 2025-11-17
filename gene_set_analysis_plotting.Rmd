@@ -507,6 +507,100 @@ pwalk(
 ```
 
 
+### Dotplot of single comparison FGSEA
+
+```{r}
+fgsea_single_dot_data <- fgsea_res_pert %>%
+  filter(
+    metric == "signed_padj",
+    batch != "batch_1_riki"
+  ) %>%
+  mutate(
+    contrast_batch = paste(contrast, recode_batch(batch)),
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway)
+  ) %>%
+  semi_join(
+      filter(
+        .,
+        padj < .01,
+        contrast %in% c("PTX", "GNE-495 + PTX vs PTX", "JNK-inh + PTX vs PTX")
+      ),
+    by = "pathway"
+  ) %>%
+  mutate(
+    padj_bin = cut(
+      padj, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("<0.001", "<0.01", "<0.05", ">=0.05"),
+      ordered_result = TRUE
+    )
+  )
+
+fgsea_single_dot_data_filtered <- fgsea_single_dot_data %>%
+  filter(
+    contrast == "PTX" |
+      str_detect(contrast, coll("vs PTX")),
+    !str_starts(database, coll("GO"))
+  ) %>%
+  mutate(
+    contrast_batch = paste(contrast, recode_batch(batch))
+  ) %>%
+  cluster_df(
+    row_var = pathway,
+    col_var = contrast_batch,
+    value_var = NES
+  )
+
+est_perc <- quantile(fgsea_single_dot_data_filtered$NES, c(.05, .95), na.rm = TRUE)
+abs_max_est_perc <- max(abs(est_perc))
+fgsea_single_dot_plot <- ggplot(
+  fgsea_single_dot_data_filtered,
+  aes(
+    x = contrast,
+    y = pathway,
+    size = padj_bin,
+    color = NES
+  )
+) +
+  geom_point() +
+  paletteer::scale_color_paletteer_c(
+    "ggthemes::Orange-Blue-White Diverging",
+    limits = c(-abs_max_est_perc, abs_max_est_perc),
+    oob = scales::squish
+  ) +
+  scale_size_manual(
+    values = c(
+      "<0.001" = 5,
+      "<0.01" = 4,
+      "<0.05" = 3,
+      ">=0.05" = 1
+    )
+  ) +
+  facet_wrap(
+    ~batch,
+    axes = "all",
+    axis.labels = "margins"
+  ) +
+  labs(
+    x = "Contrast",
+    y = "Pathway",
+    color = "Normalized\nenrichment\nscore"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+fgsea_single_dot_plot
+
+ggsave(
+  file.path("plots", "fgsea_single_perturbation_dotplot.pdf"),
+  fgsea_single_dot_plot,
+  width = 10,
+  height = 12,
+  device = cairo_pdf
+)
+```
+
+
 ## Heatmap of Reactome PTX and combo
 
 
