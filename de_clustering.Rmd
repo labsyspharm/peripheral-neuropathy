@@ -22,8 +22,11 @@ syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
 DEA performed by Riki Kawaguchi from UCLA
 
 ```{r}
-de <- syn("syn64582734") %>%
-  read_csv()
+de <- syn("syn70777776") %>%
+  read_csv() %>%
+  mutate(
+    signed_p = -sign(log2FoldChange) * log10(padj)
+  )
 
 rescue_list <- syn("syn64608137") %>%
   read_csv()
@@ -31,14 +34,44 @@ rescue_list <- syn("syn64608137") %>%
 rescue_type_list <- syn("syn64608138") %>%
   read_csv()
 
-counts_trans_ruvk4 <- syn("syn66638335") %>%
+counts_trans <- syn("syn70780244") %>%
   read_csv()
 
-de_meta <- syn("syn66637916") %>%
-  read_csv()
+de_meta <- syn("syn70780412") %>%
+  read_csv() %>%
+  mutate(
+    condition_fixed = if_else(
+      gne_combined == 0 & jnk_combined == 0 & ptx == "no",
+      "DMSO",
+      paste(
+        if_else(ptx == "yes", "PTX", NA_character_),
+        if_else(
+          gne_combined > 0,
+          paste0("GNE-495"),
+          NA_character_
+        ),
+        if_else(
+          jnk_combined > 0,
+          paste0("JNK-inh"),
+          NA_character_
+        ),
+        sep = " + "
+      ) %>%
+        paste0(
+          if_else(
+            jnk_combined > 0 | gne_combined > 0,
+            paste0(" (", if_else(experiment == 1, "3μM", "1μM"), ")"),
+            ""
+          )
+        ) %>%
+        str_remove_all("NA\\s+\\+\\s+|\\s+\\+\\s+NA") %>%
+        str_trim() %>%
+        factor(levels = str_sort(unique(.), numeric = TRUE))
+    )
+  )
 ```
 
-
+## Heatmap functions
 
 ```{r}
 library(seriation)
@@ -95,28 +128,73 @@ cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
 ```
 
 
+## LFC Heatmap
+
 ```{r}
-hm_contrasts <- c(
-  "PTX", "GNE-495", "JNK-inh",
-  "GNE-495 + PTX", "JNK-inh + PTX"
+de_conditions_hm <- de %>%
+  distinct(name, batch) %>%
+  filter(
+    # Only one PTX condition. They're identical
+    !(name == "PTX" & batch == "batch_2")
+  ) %>%
+  mutate(
+    name_display = if_else(
+      str_detect(name, "GNE|JNK"),
+      paste0(name, " (", if_else(batch == "batch_1", "3", "1"), "μM)"),
+      name
+    )
+  )
+
+de_conditions_display_order <- c(
+  "PTX",
+  "GNE-495 (1μM)",
+  "GNE-495 (3μM)",
+  "GNE-495 + PTX vs PTX (1μM)",
+  "GNE-495 + PTX vs PTX (3μM)",
+  "JNK-inh (1μM)",
+  "JNK-inh (3μM)",
+  "JNK-inh + PTX vs PTX (1μM)",
+  "JNK-inh + PTX vs PTX (3μM)",
+  "GNE-495 + JNK-inh + PTX vs PTX (1μM)"
 )
+setdiff(de_conditions_display_order, de_conditions_hm$name_display)
 
 hm_genes <- de %>%
   filter(
-    FDR < 0.05
+    k == 0,
+    name %in% c(
+      "PTX",
+      "GNE-495 + PTX vs PTX (1μM)",
+      "GNE-495 + PTX vs PTX (3μM)",
+      "JNK-inh + PTX vs PTX (1μM)",
+      "JNK-inh + PTX vs PTX (3μM)",
+      "GNE-495 + JNK-inh + PTX vs PTX (1μM)"
+    ),
+    padj < 0.05
   ) %>%
   distinct(gene_id)
 ```
 
+
 ```{r}
 hm_mat <- de %>%
+  power_inner_join(
+    de_conditions_hm,
+    by = c("name", "batch"),
+    check = check_specs(
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  filter(
+    k == 0,
+    name_display %in% de_conditions_display_order
+  ) %>%
   semi_join(hm_genes) %>%
-  filter(contrast %in% hm_contrasts) %>%
-  select(gene_id, contrast, logFC) %>%
-  pivot_wider(names_from = contrast, values_from = logFC) %>%
+  select(gene_id, name_display, signed_p) %>%
+  pivot_wider(names_from = name_display, values_from = signed_p) %>%
   column_to_rownames("gene_id") %>%
   as.matrix() %>% {
-    .[, hm_contrasts]
+    .[, de_conditions_display_order]
   }
 
 hm_mat_scaled <- hm_mat %>%
@@ -126,13 +204,21 @@ hm_mat_scaled <- hm_mat %>%
 
 row_meta <- rescue_type_list %>%
   filter(
+    perturbed_threshold == 0.05,
     gene_id %in% rownames(hm_mat),
-    rescue_definition == "significant_opposite"
+    rescue_definition == "significant_opposite",
+    batch != "batch_1_riki"
   ) %>%
-  select(
+  transmute(
     gene_id,
     direction = perturbed,
-    rescue_type
+    rescue_type,
+    concentration = if_else(batch == "batch_1", "3μM", "1μM")
+  ) %>%
+  pivot_wider(
+    names_from = concentration,
+    values_from = rescue_type,
+    names_prefix = "rescue_type_"
   ) %>%
   column_to_rownames("gene_id") %>%
   as.data.frame() %>% {
@@ -156,7 +242,12 @@ hm <- Heatmap(
     which = "row",
     col = list(
       direction = c("up" = "red", "down" = "blue", "not perturbed" = "white"),
-      rescue_type = c(
+      rescue_type_3μM = c(
+        "both" = "purple", "no rescue" = "grey",
+        "GNE-495 only" = "blue", "JNK-inh only" = "red",
+        "not perturbed" = "white"
+      ),
+      rescue_type_1μM = c(
         "both" = "purple", "no rescue" = "grey",
         "GNE-495 only" = "blue", "JNK-inh only" = "red",
         "not perturbed" = "white"
@@ -166,64 +257,59 @@ hm <- Heatmap(
   show_row_dend = FALSE
 )
 
-withr::with_pdf(
-  file.path("plots", "de_heatmaps", "all_de_genes.pdf"),
+withr::with_cairo_pdf(
+  file.path("plots", "de_heatmaps", "de_heatmap_all_combined_signed_p_scaled.pdf"),
   draw(hm),
   width = 7, height = 15
 )
 ```
 
 
-## PCA
+
+### PCA
 
 
 ```{r}
-rlog_mat <- counts_trans_ruvk4 %>%
-  filter(
-    transformation == "rlog"
+pca_combined <- counts_trans %>%
+  filter(type %in% c("vst", "vst_batch_removed")) %>%
+  group_nest(type) %>%
+  mutate(
+    pca = map(
+      data,
+      \(df) {
+        mat <- df %>%
+          column_to_rownames("gene_id") %>%
+          as.matrix()
+        prcomp(
+          t(mat),
+          center = TRUE,
+          scale = FALSE
+        )
+      }
+    )
+  )
+
+pca_x_long <- pca_combined %>%
+  transmute(
+    type,
+    x = map(
+      pca,
+      \(pca) {
+        as_tibble(
+          pca$x,
+          rownames = "sample_id_sequencing"
+        )
+      }
+    )
   ) %>%
-  select(-transformation) %>%
-  column_to_rownames("gene_id") %>%
-  as.matrix()
-
-
-pca_raw <- prcomp(
-  t(rlog_mat),
-  center = TRUE,
-  scale = FALSE
-)
-
-pca_eigen <- broom::tidy(
-  pca_raw, matrix = "eigenvalues"
-)
-
-pca_eigen_map <- with(
-  pca_eigen,
-  set_names(
-    signif(percent * 100, 2),
-    paste0("PC", seq_along(PC))
-  )
-)
-
-pca_x <- pca_raw$x %>%
-  as_tibble(rownames = "sample_id") %>%
-  left_join(
-    de_meta,
-    by = "sample_id"
-  )
-
-pca_x_long <- pca_x %>%
-  select(sample_id, starts_with("PC")) %>%
+  unnest(x) %>%
   pivot_longer(
-    starts_with("PC"),
-    names_to = "PC",
+    -c(type, sample_id_sequencing),
+    names_to = "component",
     values_to = "value"
   )
-```
 
-
-```{r}
-pca_x_vs <- combn(1:4, 2) %>%
+pca_x_vs <- combn(1:5, 2) %>%
   t() %>%
   magrittr::set_colnames(c("component_1", "component_2")) %>%
   as_tibble() %>%
@@ -235,63 +321,89 @@ pca_x_vs <- combn(1:4, 2) %>%
   ) %>%
   left_join(
     pca_x_long,
-    by = c("component_1" = "PC")
+    by = c("component_1" = "component")
   ) %>%
   left_join(
     pca_x_long,
-    by = c("component_2" = "PC", "sample_id"),
+    by = c("component_2" = "component", "sample_id_sequencing", "type"),
     suffix = c("_1", "_2")
   ) %>%
   left_join(
     de_meta,
-    by = "sample_id"
+    by = "sample_id_sequencing"
+  )
+
+pca_sd <- pca_combined %>%
+  transmute(
+    type,
+    sd = map(
+      pca,
+      \(pca) {
+        broom::tidy(pca, matrix = "eigenvalues")
+      }
+    )
+  ) %>%
+  unnest(sd) %>%
+  mutate(
+    across(PC, \(x) paste0("PC", x))
   )
 ```
 
-
 ```{r}
+rescue_colors <- c(
+  "none" = "grey70",
+  "GNE-495" = "red",
+  "JNK-inh" = "blue",
+  "GNE-495 + JNK-inh" = "purple"
+) %>%
+  colorspace::lighten(amount = .4)
 
-rd_bu_colors <- RColorBrewer::brewer.pal(5, "RdBu")
-treatment_colors <- c(
-  `JNK-inh` = rd_bu_colors[1],
-  `GNE-495` = tail(rd_bu_colors, 1),
-  `DMSO` = "gray70"
+rescue_dose_colors <- c(
+  c("none" = "grey70"),
+  set_names(
+    colorspace::lighten(c("red", "blue", "purple"), amount = .4),
+    c("GNE-495 (1 μM)", "JNK-inh (1 μM)", "GNE-495 + JNK-inh (1 μM)")
+  ),
+  set_names(
+    colorspace::lighten(c("red", "blue", "purple"), amount = .05),
+    c("GNE-495 (3 μM)", "JNK-inh (3 μM)", "GNE-495 + JNK-inh (3 μM)")
+  )
 )
 
-p <- ggplot(
-  pca_x_vs,
-  aes(
-    x = value_1,
-    y = value_2,
-    shape = paclitaxel,
-    color = treatment
-  )
-) +
-  geom_point() +
-  scale_color_manual(
-    values = treatment_colors,
-    name = "Treatment"
-  ) +
-  scale_shape_discrete(
-    name = "Paclitaxel"
-  ) +
-  facet_grid(
-    rows = vars(component_2),
-    cols = vars(component_1)
-  ) +
-  theme_bw()
-
-ps <- pca_x_vs %>%
-  group_nest(
-    component_1,
-    component_2
-  ) %>%
-  mutate(
-    across(
-      starts_with("component"),
-      \(x) fct_relabel(x, \(y) paste0(y, " (", as.character(pca_eigen_map[y]), "%)"))
+pca_vs_plots <- pca_x_vs %>%
+  power_inner_join(
+    pca_sd,
+    by = c("type", "component_1" = "PC"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
     )
   ) %>%
+  power_inner_join(
+    pca_sd,
+    by = c("type", "component_2" = "PC"),
+    suffix = c("_1", "_2"),
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) %>%
+  mutate(
+    rescue = case_when(
+      gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
+      gne_495 == "yes" ~ "GNE-495",
+      jnk_in == "yes" ~ "JNK-inh",
+      TRUE ~ "none"
+    ),
+    rescue_dose = if_else(
+      rescue != "none",
+      paste0(rescue, if_else(experiment == 1, " (3 μM)", " (1 μM)")),
+      rescue
+    ),
+    component_1_sd = paste0(component_1, " (", signif(percent_1 * 100, 2), "%)"),
+    component_2_sd = paste0(component_2, " (", signif(percent_2 * 100, 2), "%)")
+  ) %>%
+  group_nest(type) %>%
   rowwise() %>%
   mutate(
     p = list(
@@ -300,33 +412,61 @@ ps <- pca_x_vs %>%
         aes(
           x = value_1,
           y = value_2,
-          shape = paclitaxel,
-          color = treatment
+          color = ptx,
+          fill = rescue_dose,
         )
       ) +
-        geom_point() +
+        geom_point(
+          shape = 21,
+          alpha = .7
+        ) +
         scale_color_manual(
-          values = treatment_colors,
-          name = "Rescue treatment"
+          values = c(
+            "no" = "grey90",
+            "yes" = "black"
+          )
         ) +
-        scale_shape_discrete(
-          name = "Paclitaxel"
+        scale_fill_manual(
+          values = rescue_dose_colors
         ) +
+        guides(
+          fill = guide_legend(override.aes = list(shape = 21, color = NA)),
+          color = guide_legend(override.aes = list(shape = 21, fill = NA))
+        ) +
+        facet_wrap(
+          vars(component_1_sd, component_2_sd),
+          axes = "all",
+          axis.labels = "margins"
+        ) +
+        envalysis::theme_publish() +
+        coord_equal() +
         labs(
-          x = component_1,
-          y = component_2
+          x = "Component 1",
+          y = "Component 2",
+          color = "Paclitaxel",
+          fill = "Rescue treatment",
+          title = type
         )
     )
   )
 
-ps_combined <- egg::ggarrange(
-  plots = ps$p
-)
-
-ggsave(
-  file.path("plots", "pca_ruvk4_combined_1-4.pdf"),
-  ps_combined,
-  width = 10,
-  height = 8
+pwalk(
+  pca_vs_plots,
+  \(type, p, ...) {
+    ggsave(
+      file.path("rnaseq", "plots", paste0("pca_vs_all_combined_", type, ".pdf")),
+      p,
+      width = 12,
+      height = 10,
+      device = cairo_pdf
+    )
+  }
 )
 ```
+
+
+```{r}
+
+
+```
+
