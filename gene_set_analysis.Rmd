@@ -1459,6 +1459,54 @@ qsave(
 ```
 
 
+## Intersection of 3uM and 1uM PTX rescue gene sets
+
+Checking PTX + rescue vs PTX at 1uM and 3uM, taking overlap
+
+```{r}
+ptx_rescue_both_doses <- de_long_combined %>%
+  filter(
+    name %in% c(
+      "GNE-495 + PTX vs PTX",
+      "JNK-inh + PTX vs PTX"
+    ),
+    k == 0,
+    batch != "batch_1_riki"
+  ) %>%
+  pivot_wider(
+    id_cols = c(name, gene_id, gene_name),
+    names_from = batch,
+    values_from = c(log2FoldChange, padj)
+  ) %>%
+  filter(
+    padj_batch_1 < .05, padj_batch_2 < .05,
+    sign(log2FoldChange_batch_1) == sign(log2FoldChange_batch_2)
+  )
+
+ptx_rescue_both_doses_raw <- ptx_rescue_both_doses %>%
+  group_by(name) %>%
+  summarize(
+    res = fora(
+      msigdbr_of_interest_gs,
+      gene_id,
+      universe = feasible_gene_vec[["batch_1"]]
+    ) %>%
+      list(),
+    .groups = "drop"
+  )
+
+
+ptx_rescue_both_doses_long <- ptx_rescue_both_doses_raw %>%
+  unnest(res)
+
+write_csv(
+  ptx_rescue_both_doses_long,
+  file.path("results", "ptx_rescue_both_doses_fgsea_overrepresentation.csv.gz")
+)
+```
+
+
+```
 
 ## Clue queries
 
@@ -3102,7 +3150,6 @@ synStoreMany(
     "gprofiler_res.csv.gz",
     "chea3_res_raw.qs",
     "chea3_res.csv.gz",
-    "transformed_counts.csv.gz",
     "de_long_selected.csv.gz",
     "feasible_genes.csv.gz",
     "ptx_rescue_overrepresentation.qs",
@@ -3112,13 +3159,13 @@ synStoreMany(
     "indra_res.csv.gz",
     "topgo_ptx_rescue_type_list_res.csv.gz",
     "de_meta.csv.gz",
-    "transformed_counts_ruvk4.csv.gz",
     "de_long_selected_both.csv.gz",
     file.path(
       "results",
       c(
         "clue_res_rescue_gene_sets.csv.gz",
-        "clue_res_rescue_gene_sets.tar.gz"
+        "clue_res_rescue_gene_sets.tar.gz",
+        "ptx_rescue_both_doses_fgsea_overrepresentation.csv.gz"
       )
     )
   ),
