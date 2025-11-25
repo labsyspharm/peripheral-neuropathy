@@ -1,0 +1,204 @@
+---
+title: "Plotting DGE results"
+author: "Clemens Hug"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+library(ggrepel)
+
+library(conflicted)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(base::setdiff)
+conflicts_prefer(dplyr::count)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Reading DEA results
+
+Our own from combined analysis of the first and second sequencing run
+
+```{r}
+meta_combined <- syn("syn70780412") |>
+  read_csv()
+
+de_long_combined <- syn("syn70777776") |>
+  read_csv() |>
+  replace_na(list(padj = 1)) |>
+  mutate(
+    padj_min_zero = if_else(padj == 0, min(padj[padj > 0], na.rm = TRUE) * .5, padj),
+    signed_padj = -sign(log2FoldChange) * log10(padj_min_zero),
+    perturbed = case_when(
+      is.na(padj) | padj >= 0.05 ~ "not perturbed",
+      log2FoldChange > 0 ~ "up",
+      log2FoldChange < 0 ~ "down"
+    )
+  )
+```
+
+## Volcano plot
+
+```{r}
+compute_point_density <- function(df, x_col, y_col, ...) {
+  x <- df[[x_col]]
+  y <- df[[y_col]]
+
+  # Compute the 2D kernel density
+  kde <- MASS::kde2d(
+    x, y,
+    ...
+  )
+
+  # Find density at each point by interpolation
+  point_density <- fields::interp.surface(
+    obj = list(x = kde$x, y = kde$y, z = kde$z),
+    loc = cbind(x, y)
+  )
+
+  df |>
+    mutate(.density = point_density)
+}
+
+recode_batch <- \(x) recode(x, batch_1 = "(3μM rescue)", batch_2 = "(1μM rescue)", batch_1_riki = "(3μM, Riki)")
+
+ptx_show_gene_list <- c(
+  "TUBB4B", "TUBB3", "TUBB", "TUBA1A", "TUBB2B", "KCNJ10", "KCNJ13", "CACNG3", "KCNK4", "CASP3",
+  "ACAT2", "ASS1", "IDH1", "LSS", "ACSS2", "SUCNR1", "ASCL4"
+)
+
+ps <- de_long_combined |>
+  mutate(
+    across(batch, recode_batch),
+    name_display = case_when(
+      !str_detect(name, coll(" vs ")) ~ paste(name, "vs DMSO"),
+      TRUE ~ name
+    ) %>%
+      str_replace_all(coll("JNK-Inh"), "JNK-IN-8")
+  ) %>%
+  group_nest(k) |>
+  mutate(
+    p = pmap(
+      pick(everything()),
+      \(k, data, ...) {
+        p_data <- data |>
+          mutate(
+            nlog10_FDR = -log10(padj_min_zero)
+          ) |>
+          filter(is.finite(nlog10_FDR)) |>
+          group_by(name_display, batch) |>
+          mutate(
+            across(
+              c(log2FoldChange, log2FoldChange_MLE),
+              .fns = list(
+                relation = \(z) cut(
+                  z,
+                  breaks = c(-Inf, -5, 5, Inf),
+                  labels = c("<", "=", ">")
+                ),
+                limited = \(z) pmin(
+                  pmax(z, -5),
+                  5
+                )
+              )
+            )
+          ) |>
+          group_modify(
+            \(x, y) compute_point_density(x, "log2FoldChange_limited", "nlog10_FDR", n = 100, h = 2)
+          ) |>
+          mutate(
+            gene_name_repel = if_else(
+              (name == "PTX" & gene_name %in% ptx_show_gene_list) |
+              (name != "PTX" & .density < quantile(.density, .002) & !str_starts(gene_name, coll("ENSG")) & padj < .05),
+              gene_name,
+              ""
+            )
+          )
+        ggplot(
+          p_data |>
+            arrange(
+              match(perturbed, c("not perturbed", "down", "up"))
+            ),
+          aes(
+            x = log2FoldChange_limited,
+            y = nlog10_FDR,
+            text = gene_name
+          )
+        ) +
+          ggrastr::rasterize(geom_point(
+            aes(color = perturbed, shape = log2FoldChange_relation),
+            alpha = .5
+          ), dpi = 300, dev = "ragg") +
+          geom_vline(
+            xintercept = 0,
+            color = "gray",
+            linetype = "dashed"
+          ) +
+          geom_hline(
+            yintercept = -log10(.05),
+            color = "gray",
+            linetype = "dashed"
+          ) +
+          scale_color_manual(
+            values = c("not perturbed" = "gray", "up" = "#762a83", "down" = "#1b7837"),
+            guide = "none"
+          ) +
+          scale_shape_manual(
+            values = c("<" = "◂", "=" = "●", ">" = "▸"),
+            guide = "none"
+          ) +
+          geom_text(
+            aes(
+              x = if_else(perturbed == "down", -Inf, Inf),
+              hjust = if_else(perturbed == "down", 0, 1),
+              label = paste(n, perturbed)
+            ),
+            data = \(x) dplyr::count(x, perturbed) |>
+              filter(perturbed != "not perturbed"),
+            y = Inf,
+            vjust = 1,
+            inherit.aes = FALSE
+          ) +
+          geom_text_repel(
+            aes(
+              label = gene_name_repel
+            ),
+            max.iter = 1e4,
+            max.time = 2,
+            max.overlaps = Inf,
+            size = 2,
+            seed = 42,
+            min.segment.length = 0
+          ) +
+          facet_wrap(
+            ~name_display + batch,
+            scales = "free"
+          ) +
+          labs(
+            x = "log2 fold-change",
+            y = "-log10(adjusted p-value)"
+          )
+      }
+    )
+  )
+
+pwalk(
+  ps,
+  \(k, p, ...) {
+    ggsave(
+      file.path("plots", paste0("volcano_", k, "_raster_bw1.pdf")),
+      p, width = 18, height = 18, device = cairo_pdf
+    )
+  }
+)
+
+```
