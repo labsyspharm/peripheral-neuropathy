@@ -908,6 +908,26 @@ qsave(
 # fgsea_pert_res <- qread("fgsea_pert_res.qs")
 ```
 
+Briefly investigate P38MAPK_EVENTS specifically
+
+```{r}
+fgsea_pert_input %>%
+  filter(contrast == "GNE-495 + PTX vs PTX", metric == "signed_padj") %>%
+  rowwise() %>%
+  mutate(
+    p = list(
+      plotEnrichment(
+        msigdbr_of_interest_gs[["REACTOME_P38MAPK_EVENTS"]],
+        gene_stats
+      ) +
+        labs(title = batch)
+    )
+  ) %>%
+  with(set_names(p, batch)) %>%
+  patchwork::wrap_plots()
+```
+
+
 
 ```{r}
 fgsea_pert_res %>%
@@ -1431,32 +1451,206 @@ ptx_rescue_intersections_overrepresentation %>%
 
 
 ```{r}
-ptx_rescue_overrepresentation_raw <- ptx_rescue_gene_sets_list %>%
+library(furrr)
+plan(multicore, workers = 6)
+ptx_single_perturbation_overrep_raw <- de_long_selected_both %>%
+  crossing(
+    significant_threshold = c(.05)
+  ) %>%
   mutate(
-    res = map(
-      gene_vec,
-      \(x) {
-        gs <- names(x)[x < .05]
+    direction = if_else(logFC > 0, "up", "down")
+  ) %>%
+  filter(
+    FDR < significant_threshold
+  ) %>% {
+    bind_rows(
+      mutate(
+        ., direction = "both"
+      ),
+      .
+    )
+  } %>%
+  group_nest(contrast, direction, significant_threshold, batch) %>%
+  mutate(
+    res = future_map2(
+      data, batch,
+      \(df, batch) {
         fora(
           msigdbr_of_interest_gs,
-          gs,
-          universe = feasible_gene_vec
+          df$gene_id,
+          universe = feasible_gene_vec[[batch]]
+        )
+      },
+      .progress = TRUE
+    ),
+    res_reduced = future_pmap(
+      list(data, res, batch),
+      \(df, res, batch) {
+        collapsePathwaysORA(
+          filter(res, padj < .01),
+          msigdbr_of_interest_gs,
+          df$gene_id,
+          universe = feasible_gene_vec[[batch]]
+        )
+      },
+      .progress = TRUE
+    )
+  )
+plan(sequential)
+
+qsave(
+  ptx_single_perturbation_overrep_raw,
+  file.path("results", "ptx_single_perturbation_overrepresentation_raw.qs")
+)
+
+ptx_single_perturbation_overrep <-ptx_single_perturbation_overrep_raw %>%
+  transmute(
+    contrast, direction, significant_threshold, batch,
+    res = map2(
+      res, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
         )
       }
     )
-  )
-
-
-ptx_rescue_overrepresentation <- ptx_rescue_overrepresentation_raw %>%
-  select(-gene_vec) %>%
+  ) %>%
   unnest(res)
 
 qsave(
-  ptx_rescue_overrepresentation,
-  "ptx_rescue_overrepresentation.qs"
+  ptx_single_perturbation_overrep,
+  file.path("results", "ptx_single_perturbation_overrepresentation.qs")
 )
 
 ```
+
+### FGSEA overrepresentation on LFC clusters
+
+```{r}
+lfc_clusters <- read_csv(
+  file.path("results", "de_heatmap_all_combined_signed_p_scaled_smaller_hc_clusters.csv")
+)
+
+library(furrr)
+plan(multicore, workers = 6)
+lfc_clusters_overrep_raw <- lfc_clusters %>%
+  group_nest(.cluster) %>%
+  mutate(
+    res = future_map(
+      data,
+      \(df) {
+        fora(
+          msigdbr_of_interest_gs,
+          df$gene_id,
+          universe = feasible_gene_vec[["batch_1"]]
+        )
+      },
+      .progress = TRUE
+    ),
+    res_reduced = future_pmap(
+      list(data, res),
+      \(df, res) {
+        collapsePathwaysORA(
+          filter(res, padj < .01),
+          msigdbr_of_interest_gs,
+          df$gene_id,
+          universe = feasible_gene_vec[["batch_1"]]
+        )
+      },
+      .progress = TRUE
+    )
+  )
+plan(sequential)
+
+qsave(
+  lfc_clusters_overrep_raw,
+  file.path("results", "lfc_clusters_overrep_raw.qs")
+)
+
+lfc_clusters_overrep <- lfc_clusters_overrep_raw %>%
+  transmute(
+    .cluster,
+    res = map2(
+      res, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
+        )
+      }
+    )
+  ) %>%
+  unnest(res)
+
+qsave(
+  lfc_clusters_overrep,
+  file.path("results", "lfc_clusters_overrepresentation.csv.gz")
+)
+```
+
+
+#### Excel
+
+
+```{r}
+library(openxlsx)
+
+significant_style <- createStyle(fontColour = "red")
+
+lfc_clusters_overrep_excel <- createWorkbook()
+
+lfc_clusters_overrep %>%
+  select(-c(overlapGenes, is_main, parent_pathway)) %>%
+  group_by(.cluster) %>%
+  group_walk(
+    \(df, g) {
+      addWorksheet(
+        lfc_clusters_overrep_excel,
+        g$.cluster
+      )
+      writeDataTable(
+        lfc_clusters_overrep_excel,
+        sheet = g$.cluster,
+        x = df,
+        tableStyle = "TableStyleLight8"
+      )
+      setColWidths(
+        lfc_clusters_overrep_excel, g$.cluster,
+        cols = seq_len(ncol(df)),
+        widths = "auto"
+      )
+      walk(
+        which(names(df) == "padj"),
+        \(i) {
+          data_rows <- nrow(df) + 1L  # +1 for header
+          de_col_data <- df[[i]]
+          significant_rows <- which(!is.na(de_col_data) & de_col_data < 0.05) + 1L  # +1 for header
+          if (length(significant_rows) > 0) {
+            addStyle(
+              wb = lfc_clusters_overrep_excel,
+              sheet = g$.cluster,
+              style = significant_style,
+              rows = significant_rows,
+              cols = i,
+              gridExpand = FALSE
+            )
+          }
+        }
+      )
+    }
+  )
+
+saveWorkbook(
+  lfc_clusters_overrep_excel,
+  file.path("tables", "lfc_clusters_overrepresentation.xlsx"),
+  overwrite = TRUE
+)
+
+```
+
 
 
 ## Intersection of 3uM and 1uM PTX rescue gene sets
@@ -1484,9 +1678,30 @@ ptx_rescue_both_doses <- de_long_combined %>%
   )
 
 ptx_rescue_both_doses_raw <- ptx_rescue_both_doses %>%
-  group_by(name) %>%
+  mutate(
+    direction = if_else(
+      log2FoldChange_batch_1 > 0,
+      "up",
+      "down"
+    )
+  ) %>% {
+    bind_rows(
+      mutate(
+        ., direction = "both"
+      ),
+      .
+    )
+  } %>%
+  group_by(name, direction) %>%
   summarize(
     res = fora(
+      msigdbr_of_interest_gs,
+      gene_id,
+      universe = feasible_gene_vec[["batch_1"]]
+    ) %>%
+      list(),
+    res_reduced = collapsePathwaysORA(
+      filter(res[[1]], padj < .01),
       msigdbr_of_interest_gs,
       gene_id,
       universe = feasible_gene_vec[["batch_1"]]
@@ -1495,8 +1710,25 @@ ptx_rescue_both_doses_raw <- ptx_rescue_both_doses %>%
     .groups = "drop"
   )
 
+qsave(
+  ptx_rescue_both_doses_raw,
+  file.path("results", "ptx_rescue_both_doses_fgsea_overrepresentation_raw.qs")
+)
 
 ptx_rescue_both_doses_long <- ptx_rescue_both_doses_raw %>%
+  transmute(
+    name, direction,
+    res = map2(
+      res, res_reduced,
+      \(full, reduced) {
+        mutate(
+          full,
+          is_main = pathway %in% reduced$mainPathways,
+          parent_pathway = reduced$parentPathways[pathway]
+        )
+      }
+    )
+  ) %>%
   unnest(res)
 
 write_csv(
@@ -1506,7 +1738,112 @@ write_csv(
 ```
 
 
+### Alluvial diagram of doses combined rescue data
+
+```{r}
+library(ggalluvial)
+
+rescue_both_doses_alluvial_data <-  de_long_combined %>%
+  filter(
+    name %in% c(
+      "GNE-495 + PTX vs PTX",
+      "JNK-inh + PTX vs PTX"
+    ),
+    k == 0,
+    batch != "batch_1_riki"
+  ) %>%
+  pivot_wider(
+    id_cols = c(name, gene_id, gene_name),
+    names_from = batch,
+    values_from = c(log2FoldChange, padj)
+  )
+
+ptx_rescue_type_list %>%
+  count(perturbed)
+
+ptx_rescue_alluvial_plots <- ptx_rescue_type_list %>%
+  group_nest(perturbed_threshold, batch, rescue_definition) %>%
+  mutate(
+    alluvial_data = map(
+      data,
+      \(x) count(
+        x,
+        `PTX perturbed` = perturbed,
+        `GNE-495 perturbed` = `GNE-495`,
+        `JNK-inh perturbed` = `JNK-inh`,
+        rescue_type
+      ) %>%
+        filter(`PTX perturbed` != "not perturbed")
+    ),
+    lode_data = map(
+      alluvial_data,
+      \(x) to_lodes_form(
+        x,
+        ends_with("perturbed"),
+        key = "Contrast", value = "Gene set"
+      )
+    ),
+    p = map(
+      lode_data,
+      \(x)
+      ggplot(
+        x,
+        aes(
+          x = Contrast, y = n, stratum = `Gene set`, alluvium = alluvium
+        )
+      ) +
+        scale_x_discrete(expand = c(0.05, 0.05)) +
+        geom_alluvium(
+          aes(
+            # color = `PTX perturbed 2`,
+            fill = rescue_type
+          ),
+          width = 1/10
+        ) +
+        # ggokabeito::scale_color_okabe_ito(order = c(2, 1), guide = "none") +
+        scale_fill_manual(
+          values = rescue_type_colors
+        ) +
+        labs(x = NULL) +
+        # scale_fill_manual(
+        #     values = c(existing = "#a2a2a2", added = "#c81919"),
+        #     guide = "none"
+        # ) +
+        geom_stratum(width = 1/6) +
+        # geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+        geom_label(stat = "stratum", aes(label = after_stat(stratum))) +
+        geom_text(
+          aes(
+            x = stage(Contrast, after_scale = x + .12),
+            label = n
+          ),
+          stat = StatAlluvium,
+          hjust = 0,
+          data = \(x) filter(x, as.integer(Contrast) == 1L)
+        ) +
+        theme_minimal() +
+        # labs(y = "Data points", fill = NA) +
+        theme(
+            panel.grid.major.x = element_blank()
+        ) +
+        coord_cartesian(clip = "off")
+    )
+  )
+
+pwalk(
+  ptx_rescue_alluvial_plots,
+  \(p, perturbed_threshold, batch, rescue_definition, ...) ggsave(
+    file.path("plots", paste0("ptx_rescue_threshold_", perturbed_threshold, "_", rescue_definition, "_alluvium_", batch, ".pdf")),
+    p, width = 6, height = 4
+  )
+)
+
+ggsave(
+  file.path("plots", "ptx_rescue_no_threshold_alluvium.pdf"),
+  p, width = 6, height = 4
+)
 ```
+
 
 ## Clue queries
 
@@ -3165,7 +3502,9 @@ synStoreMany(
       c(
         "clue_res_rescue_gene_sets.csv.gz",
         "clue_res_rescue_gene_sets.tar.gz",
-        "ptx_rescue_both_doses_fgsea_overrepresentation.csv.gz"
+        "ptx_rescue_both_doses_fgsea_overrepresentation.csv.gz",
+        "ptx_single_perturbation_overrepresentation.qs",
+        "lfc_clusters_overrepresentation.csv.gz"
       )
     )
   ),
