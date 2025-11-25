@@ -521,154 +521,6 @@ ggsave(
 ```
 
 
-### PCA
-
-
-```{r}
-pca_combined <- combined_counts %>%
-  filter(type %in% c("vst", "vst_batch_removed")) %>%
-  group_nest(type) %>%
-  mutate(
-    pca = map(
-      data,
-      \(df) {
-        mat <- df %>%
-          column_to_rownames("gene_id") %>%
-          as.matrix()
-        prcomp(
-          t(mat),
-          center = TRUE,
-          scale = FALSE
-        )
-      }
-    )
-  )
-
-pca_x <- pca_combined %>%
-  mutate(
-    x = map(
-      pca,
-      \(pca) {
-        as_tibble(
-          pca$x,
-          rownames = "sample_id_sequencing"
-        ) %>%
-          left_join(
-            meta_raw,
-            by = "sample_id_sequencing"
-          )
-      }
-    )
-  ) %>%
-  select(type, x) %>%
-  unnest(x)
-
-```
-
-```{r}
-p <- ggplot(
-  pca_x %>%
-    mutate(
-      rescue = case_when(
-        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
-        gne_495 == "yes" ~ "GNE-495",
-        jnk_in == "yes" ~ "JNK-inh",
-        TRUE ~ "none"
-      )
-    ),
-  aes(
-    x = PC1, y = PC2,
-    color = ptx,
-    fill = rescue,
-    shape = batch,
-    text = sample_id_sequencing
-  )
-) +
-  geom_point(
-    alpha = .7
-  ) +
-  scale_shape_manual(
-    values = c(21, 22, 23, 24, 25)
-  ) +
-  scale_color_manual(
-    values = c(
-      "no" = NA,
-      "yes" = "black"
-    )
-  ) +
-  scale_fill_manual(
-    values = c(
-      "none" = "grey70",
-      "GNE-495" = "red",
-      "JNK-inh" = "blue",
-      "GNE-495 + JNK-inh" = "purple"
-    )
-  ) +
-  guides(
-    fill = guide_legend(override.aes = list(shape = 21, color = NA)),
-    color = guide_legend(override.aes = list(shape = 21, fill = NA))
-  ) +
-  facet_wrap(~type, scales = "free")
-p
-plotly::ggplotly(p)
-
-ggsave(
-  here("rnaseq", "plots", "pca_combined_vst_pc1_pc2.pdf"),
-  p, width = 10, height = 4
-)
-
-p <- ggplot(
-  pca_x %>%
-    mutate(
-      rescue = case_when(
-        gne_495 == "yes" & jnk_in == "yes" ~ "GNE-495 + JNK-inh",
-        gne_495 == "yes" ~ "GNE-495",
-        jnk_in == "yes" ~ "JNK-inh",
-        TRUE ~ "none"
-      )
-    ),
-  aes(
-    x = PC3, y = PC4,
-    color = ptx,
-    fill = rescue,
-    shape = sequencing_batch,
-    text = sample_id_sequencing
-  )
-) +
-  geom_point(
-    alpha = .7
-  ) +
-  scale_shape_manual(
-    values = c(21, 22)
-  ) +
-  scale_color_manual(
-    values = c(
-      "no" = "grey70",
-      "yes" = "black"
-    )
-  ) +
-  scale_fill_manual(
-    values = c(
-      "none" = "grey70",
-      "GNE-495" = "red",
-      "JNK-inh" = "blue",
-      "GNE-495 + JNK-inh" = "purple"
-    )
-  ) +
-  guides(
-    fill = guide_legend(override.aes = list(shape = 21, color = NA)),
-    color = guide_legend(override.aes = list(shape = 21, fill = NA))
-  ) +
-  facet_wrap(
-    ~type, scales = "free"
-  )
-p
-ggsave(
-  here("rnaseq", "plots", "pca_combined_vst_pc3_pc4.pdf"),
-  p, width = 10, height = 4
-)
-```
-
 
 ### EMM analysis
 
@@ -803,6 +655,8 @@ write_csv(
 # )
 ```
 
+In the end using k = 0 for RUV as batch effects are modeled explicitly
+Additional RUV components may just remove real biological variation here
 
 ## DESeq2 using RUVk normalization
 
@@ -1350,6 +1204,109 @@ write_csv(
 # res_emm_long <- read_csv(
 #   here("rnaseq", "combined_deseq2_emm_ruv_results.csv.gz")
 # )
+```
+
+
+### Average effect doses
+
+```{r}
+mdl_emm_ruv_avg <- de_combined_ruv |>
+  mutate(
+    mdl = map(
+      de,
+      \(de) {
+        single_gene_data <- colData(de) |>
+          as_tibble() |>
+          mutate(
+            expression = combined_counts |>
+              filter(type == "vst", gene_id == "ENSG00000109084") |>
+              select(-type, -gene_id) |>
+              unlist()
+          )
+        lm(
+          paste(
+            "expression",
+            paste(as.character(design(de)), collapse = " ")
+          ) |>
+            as.formula(),
+          data = single_gene_data
+        )
+      }
+    ),
+    emm = map2(
+      mdl, k,
+      \(mdl, k) {
+        nuisance_values <- set_names(
+          rep(0, k),
+          paste0("W_", seq_len(k))
+        )
+        list(
+          combined_batch = emmeans(
+            mdl, ~ptx + gne_495_3 + jnk_in_3 + gne_495_1 + jnk_in_1,
+            at = c(
+              nuisance_values
+            )
+          )
+        )
+      }
+    )
+  )
+
+res_emm_ruv_avg_contrasts <- tribble(
+  ~name, ~numerator, ~denominator,
+  "GNE-495", "no yes no", "no no no",
+  "JNK-inh", "no no yes", "no no no",
+  "GNE-495 + PTX", "yes yes no", "no no no",
+  "JNK-inh + PTX", "yes no yes", "no no no",
+  "PTX", "yes no no", "no no no",
+  "GNE-495 + PTX vs PTX", "yes yes no", "yes no no",
+  "JNK-inh + PTX vs PTX", "yes no yes", "yes no no",
+  "GNE-495 + JNK-inh + PTX vs PTX", "yes yes yes", "yes no no",
+  "GNE-495 + JNK-inh", "no yes yes", "no no no",
+  "GNE-495 + JNK-inh + PTX vs JNK-inh + PTX", "yes yes yes", "yes no yes",
+  "GNE-495 + JNK-inh + PTX vs GNE-495 + PTX", "yes yes yes", "yes yes no",
+  "GNE-495 + JNK-inh + PTX", "yes yes yes", "no no no"
+)
+
+res_emm_ruv_avg <- mdl_emm_ruv_avg |>
+  select(-data) |>
+  unnest_longer(emm, indices_to = "batch", values_to = "emm") |>
+  mutate(
+    res = pmap(
+      pick(everything()),
+      \(emm, de, mdl, ...) {
+        contr <- contrast(emm, method = "revpairwise")
+        contr@grid %>%
+          as_tibble() %>%
+          mutate(
+            contrast_vec = asplit(contr@linfct, 1)
+          ) %>%
+          mutate(
+            res = map(
+              contrast_vec,
+              \(x) {
+                contrast_de <- set_names(
+                  x[colnames(model.matrix(mdl))],
+                  resultsNames(de)
+                )
+                extract_deseq_result(
+                  de,
+                  contrast = contrast_de
+                )
+              }
+            )
+          ) %>%
+          select(-contrast_vec) %>%
+          unnest(res)
+      }
+    )
+  )
+
+qsave(
+  res_emm_ruv,
+  here("rnaseq", "combined_deseq2_emm_ruv_results.qs")
+)
+
 ```
 
 ## EdgeR DE
