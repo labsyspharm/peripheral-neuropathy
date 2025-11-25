@@ -38,6 +38,15 @@ de_long_selected <- syn("syn70748503") %>%
 fgsea_overrep <- syn("syn64582959") %>%
   qread()
 
+fgsea_overrep_single_treatments <- syn("syn71710650") %>%
+  qread()
+
+fgsea_overrep_both_doses <- syn("syn71703313") %>%
+  read_csv()
+
+fgsea_overrep_clusters <- syn("syn71761437") %>%
+  qread()
+
 fgsea_intersection_overrep <- syn("syn64586672") %>%
   qread()
 
@@ -3017,6 +3026,478 @@ pwalk(
   }
 )
 ```
+
+
+## Dot plot of overrepresentation both doses
+
+```{r}
+fgsea_overrep_both_doses %>%
+  filter(padj < .05) %>%
+  count(name, direction)
+
+fgsea_overrep_single_treatments %>%
+  filter(padj < .05) %>%
+  count(contrast, direction, significant_threshold, batch) %>%
+  print(n = Inf)
+```
+  name                 direction     n
+  <chr>                <chr>     <int>
+1 GNE-495 + PTX vs PTX both       1350
+2 GNE-495 + PTX vs PTX down        747
+3 GNE-495 + PTX vs PTX up          762
+4 JNK-inh + PTX vs PTX both       2955
+5 JNK-inh + PTX vs PTX down       1923
+6 JNK-inh + PTX vs PTX up         1404
+
+
+```{r}
+combine_updown <- function(data, direction_col, fold_change_col, p_col, group_cols, p_threshold = .05) {
+  group_syms <- syms(group_cols)
+  combine_impl <- function(d, g) {
+    direction <- if (all(d[[p_col]] < p_threshold)) {
+      "both"
+    } else if (all(d[[p_col]] >= p_threshold)) {
+      "none"
+    } else {
+      d[[direction_col]][which.min(d[[p_col]])]
+    }
+    min_p_idx <- which.min(d[[p_col]])
+    fold_change <- if (direction == "both") {
+      NA_real_
+    } else {
+      d[[fold_change_col]][min_p_idx]
+    }
+    p_value <- d[[p_col]][min_p_idx]
+    tibble(
+      direction = direction,
+      fold_change = fold_change,
+      p_value = p_value
+    )
+  }
+  data %>%
+    group_by(!!!group_syms) %>%
+    group_modify(combine_impl) %>%
+    ungroup()
+}
+
+fgsea_overrep_ptx_updown_combined <- fgsea_overrep_single_treatments %>%
+  filter(
+    contrast == "PTX",
+    direction %in% c("up", "down"),
+    significant_threshold == .05,
+    batch %in% c("batch_1", "batch_2")
+  ) %>%
+  mutate(
+    log2_foldEnrichment = log2(if_else(foldEnrichment == 0, .5, foldEnrichment))
+  ) %>%
+  combine_updown(
+    direction_col = "direction",
+    fold_change_col = "log2_foldEnrichment",
+    p_col = "padj",
+    group_cols = c("contrast", "pathway", "batch"),
+    p_threshold = .01
+  )
+
+fgsea_overrep_both_doses_updown_combined <- fgsea_overrep_both_doses %>%
+  filter(
+    direction %in% c("up", "down")
+  ) %>%
+  mutate(
+    # Replacing -Inf with -1 for log2 fold enrichment
+    estimate = log2(if_else(foldEnrichment == 0, .5, foldEnrichment))
+  ) %>%
+  combine_updown(
+    direction_col = "direction",
+    fold_change_col = "log2_foldEnrichment",
+    p_col = "padj",
+    group_cols = c("name", "pathway"),
+    p_threshold = .01
+  )
+fgsea_overrep_both_doses_updown_combined %>%
+  filter(is.na(p_value))
+```
+
+Can't use combination strategy so well for PTX because many gene sets are enriched
+in both up and down directions. Using "both"
+
+```{r}
+fgsea_overrep_ptx <- fgsea_overrep_single_treatments %>%
+  filter(
+    contrast == "PTX",
+    direction == "both",
+    significant_threshold == .05,
+    batch == "batch_1"
+  )
+
+fgsea_overrep_both_doses_filtered <- fgsea_overrep_both_doses %>%
+  filter(
+    direction == "both"
+  )
+
+fgsea_overrep_both_doses_and_ptx <- bind_rows(
+  fgsea_overrep_ptx,
+  fgsea_overrep_both_doses_filtered %>%
+    rename(contrast = name)
+) %>%
+  mutate(
+    # Replacing -Inf with -1 for log2 fold enrichment
+    log2_foldEnrichment = log2(if_else(foldEnrichment == 0, .5, foldEnrichment))
+  )
+
+
+fgsea_overrep_both_doses_updown_combined_dot_plots <- fgsea_overrep_both_doses_and_ptx %>%
+  mutate(
+    padj_bin = cut(
+      padj,
+      breaks = c(0, .001, .01, .05, 1),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    ),
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway)
+  ) %>%
+  filter(
+    database %in% c("REACTOME", "HALLMARK", "PID", "KEGG_MEDICUS")
+  ) %>%
+  crossing(
+    p_threshold = c(0.001, .01, .05)
+  ) %>%
+  group_nest(p_threshold) %>%
+  mutate(
+    res = map2(
+      data, p_threshold,
+      \(x, y) {
+        # browser()
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, contrast) %>%
+        #     filter(padj < y),
+        #   by = "pathway"
+        # )
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, contrast) %>%
+        #     arrange(padj) %>%
+        #     slice_head(n = 20),
+        #   by = "pathway"
+        # )
+        d <- semi_join(
+          x,
+          group_by(x, pathway) %>%
+            filter(padj < y) %>%
+            summarize(groups = paste(unique(contrast), collapse = "_"), p_mean = 1 / sum(1 / padj, na.rm = TRUE)) %>%
+            group_by(groups) %>%
+            arrange(p_mean) %>%
+            slice_head(n = 20),
+          by = "pathway"
+        )
+        dwide <- d %>%
+          arrange(pathway) %>%
+          pivot_wider(
+            id_cols = pathway,
+            names_from = contrast,
+            values_from = log2_foldEnrichment
+          )
+        dmat <- dwide %>%
+          column_to_rownames("pathway") %>%
+          as.matrix() %>%
+          dist()
+        # browser()
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        row_labels <- clust$labels[clust$order] %>% {
+          set_names(
+            str_replace_all(., coll("_"), " ") %>%
+              str_sub(start = 2),
+            .
+          )
+        }
+        # sim_hm <- msigdbr_of_interest_sim_trans[
+        #   rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
+        # ] %>%
+        #   pheatmap(
+        #     cluster_rows = FALSE,
+        #     cluster_cols = FALSE
+        #   )
+        est_perc <- quantile(d$log2_foldEnrichment, c(.05, .95))
+        abs_max_est_perc <- max(abs(est_perc))
+        p <- ggplot(
+          d %>%
+            mutate(
+              pathway = factor(pathway, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = contrast,
+            y = pathway,
+            color = log2_foldEnrichment,
+            size = padj_bin
+          )
+        ) +
+          geom_point(shape = 16) +
+          # scale_color_viridis_c(trans = "pseudo_log") +
+          # scale_color_distiller(
+          #   limits = c(-abs_max_est_perc, abs_max_est_perc),
+          #   palette = "RdYlBu", trans = "pseudo_log",
+          #   oob = scales::squish
+          # ) +
+          paletteer::scale_color_paletteer_c(
+            palette = "pals::ocean.balance",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish
+          ) +
+          scale_size_manual(
+            values = rev(c("<0.001" = 6, "<0.01" = 4, "<0.05" = 3, "ns" = 2))
+          ) +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(
+            breaks = names(row_labels),
+            labels = unname(row_labels)
+          ) +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 0)
+          ) +
+          labs(
+            x = NULL,
+            y = NULL,
+            size = NULL
+          )
+        list(
+          p = p,
+          clust_data = d
+          # sim_hm = sim_hm
+        ) %>%
+          map(list)
+      }
+    )
+  ) %>%
+  select(-data) %>%
+  unnest_wider(
+    res
+  )
+
+flag_similar_adjacent_leaves(clust, msigdbr_of_interest_sim_trans, .6)
+
+pwalk(
+  fgsea_intersection_dotplot_data_single,
+  \(p, rescue_definition, p_threshold, perturbed_threshold, ...) {
+    ggsave(
+      here("plots", "gene_set_analysis", paste0("fgsea_rescue_overrep_dotplot_", rescue_definition, "_", perturbed_threshold, "_", p_threshold, ".pdf")),
+      p[[1]], width = 9.8, height = 9
+    )
+    # withr::with_pdf(
+    #   file.path("plots", "overrep", paste0("overrep_intersection_dotplot_", rescue_definition, "_", p_threshold, "_similarity.pdf")),
+    #   draw(sim_hm[[1]]),
+    #   width = 9.8, height = 9
+    # )
+  }
+)
+
+
+```
+
+### Up down separately
+
+```{r}
+fgsea_overrep_ptx <- fgsea_overrep_single_treatments %>%
+  filter(
+    contrast == "PTX",
+    direction != "both",
+    significant_threshold == .05,
+    batch == "batch_1"
+  )
+
+fgsea_overrep_both_doses_filtered <- fgsea_overrep_both_doses %>%
+  filter(
+    direction != "both"
+  )
+
+fgsea_overrep_both_doses_and_ptx <- bind_rows(
+  fgsea_overrep_ptx,
+  fgsea_overrep_both_doses_filtered %>%
+    rename(contrast = name)
+) %>%
+  mutate(
+    # Replacing -Inf with -1 for log2 fold enrichment
+    log2_foldEnrichment = log2(if_else(foldEnrichment == 0, .5, foldEnrichment)),
+    directed_enrichment = pmax(
+      log2_foldEnrichment,
+      0
+    ) * if_else(direction == "up", 1, -1)
+  )
+
+
+fgsea_overrep_both_doses_updown_combined_dot_plots <- fgsea_overrep_both_doses_and_ptx %>%
+  mutate(
+    padj_bin = cut(
+      padj,
+      breaks = c(0, .001, .01, .05, 1),
+      labels = c("<0.001", "<0.01", "<0.05", "ns")
+    ),
+    database = str_extract(pathway, "^(REACTOME|HALLMARK|PID|KEGG_MEDICUS|GOBP|GOMF|GOCC)"),
+    pathway = abbreviate_prefix(pathway)
+  ) %>%
+  filter(
+    database %in% c("REACTOME", "HALLMARK", "PID", "KEGG_MEDICUS")
+  ) %>%
+  crossing(
+    p_threshold = c(0.001, .01, .05)
+  ) %>%
+  group_nest(p_threshold) %>%
+  mutate(
+    res = map2(
+      data, p_threshold,
+      \(x, y) {
+        # browser()
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, contrast) %>%
+        #     filter(padj < y),
+        #   by = "pathway"
+        # )
+        # d <- semi_join(
+        #   x,
+        #   group_by(x, contrast) %>%
+        #     arrange(padj) %>%
+        #     slice_head(n = 20),
+        #   by = "pathway"
+        # )
+        d <- semi_join(
+          x,
+          group_by(x, pathway) %>%
+            filter(padj < y, is_main) %>%
+            summarize(groups = paste(sort(unique(contrast)), collapse = "_"), p_mean = 1 / sum(1 / padj, na.rm = TRUE)) %>%
+            group_by(groups) %>%
+            arrange(p_mean) %>%
+            slice_head(n = 10) %>%
+            bind_rows(tibble(pathway = "P_P38_MK2_PATHWAY")),
+          by = "pathway"
+        )
+        dwide <- d %>%
+          arrange(pathway) %>%
+          pivot_wider(
+            id_cols = pathway,
+            names_from = c(direction, contrast),
+            values_from = directed_enrichment
+          )
+        dmat <- dwide %>%
+          column_to_rownames("pathway") %>%
+          as.matrix() %>%
+          dist()
+        # browser()
+        clust <- hclust(dmat, method = "average") %>%
+          reorder(dmat, method = "OLO")
+        row_labels <- clust$labels[clust$order] %>% {
+          set_names(
+            str_replace_all(., coll("_"), " ") %>%
+              str_sub(start = 2),
+            .
+          )
+        }
+        # sim_hm <- msigdbr_of_interest_sim_trans[
+        #   rev(clust$labels[clust$order]), rev(clust$labels[clust$order])
+        # ] %>%
+        #   pheatmap(
+        #     cluster_rows = FALSE,
+        #     cluster_cols = FALSE
+        #   )
+        est_perc <- quantile(d$directed_enrichment, c(.05, .95))
+        abs_max_est_perc <- max(abs(est_perc))
+        p <- ggplot(
+          d %>%
+            mutate(
+              pathway = factor(pathway, levels = clust$labels[clust$order])
+            ),
+          aes(
+            x = contrast,
+            y = pathway,
+            color = directed_enrichment,
+            size = padj_bin,
+            shape = direction
+          )
+        ) +
+          geom_text(
+            aes(
+              label = if_else(direction == "up", "◖", "◗"),
+              hjust = if_else(direction == "up", .5, .5)
+            ),
+            vjust = .5
+          ) +
+          guides(
+            size = guide_legend(override.aes = list(shape = "◖"))
+          ) +
+          paletteer::scale_color_paletteer_c(
+            palette = "ggthemes::Orange-Blue-White Diverging",
+            limits = c(-abs_max_est_perc, abs_max_est_perc),
+            oob = scales::squish,
+            direction = -1
+          ) +
+          scale_size_manual(
+            values = rev(c("<0.001" = 8, "<0.01" = 6, "<0.05" = 4, "ns" = 2))
+          ) +
+          scale_x_discrete(position = "top") +
+          scale_y_discrete(
+            breaks = names(row_labels),
+            labels = unname(row_labels)
+          ) +
+          theme(
+            axis.text.x = element_text(angle = 45, hjust = 0),
+            panel.grid.major.x = element_blank()
+          ) +
+          labs(
+            x = NULL,
+            y = NULL,
+            size = "FDR",
+            color = "log2 fold\nenrichment"
+          )
+        list(
+          p = p,
+          clust_data = d
+          # sim_hm = sim_hm
+        ) %>%
+          map(list)
+      }
+    )
+  ) %>%
+  select(-data) %>%
+  unnest_wider(
+    res
+  )
+
+pwalk(
+  fgsea_overrep_both_doses_updown_combined_dot_plots,
+  \(p_threshold, p, ...) {
+    ggsave(
+      file.path(
+        "plots", "gene_set_analysis", paste0("fgsea_overrep_both_doses_updown_dotplot_separate_", p_threshold, ".pdf")
+      ), p[[1]], width = 6, height = 12, dev = cairo_pdf
+    )
+  }
+)
+```
+
+```{r}
+fgsea_overrep_both_doses_and_ptx %>%
+  filter(
+    str_detect(pathway, coll("p38", ignore_case = TRUE))
+  ) %>%
+  arrange(pval) %>%
+  View()
+
+fgsea_res_pert %>%
+  filter(
+    str_detect(pathway, coll("p38", ignore_case = TRUE)),
+    metric == "signed_padj"
+  ) %>%
+  View()
+```
+
+
+## Enrichment bar graphs on DE gene clusters
+
+```{r}
+fgsea_overrep_clusters
+```
+
+
 
 TODO:
 1. Heatmap of logFC all DE genes, including JNK+GNE double/triple treatments
