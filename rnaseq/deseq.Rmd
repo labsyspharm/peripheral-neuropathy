@@ -1549,6 +1549,23 @@ ggsave(
 )
 ```
 
+## Export for GEO
+
+```{r}
+geo_counts <- raw_salmon_combined[c("abundance", "counts", "length")] %>%
+  map(
+    \(x) as_tibble(x, rownames = "gene_id")
+  ) %>%
+  bind_rows(.id = "type")
+
+write_csv(
+  geo_counts,
+  here("rnaseq", "combined_counts_salmon.csv.gz")
+)
+```
+
+
+## Save to Synapse
 
 ```{r}
 synStoreMany(
